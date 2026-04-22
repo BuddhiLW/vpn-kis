@@ -1,0 +1,3 @@
+{:project-id "vpn-kis"
+ :description "VPN kill-switch firewall for AirVPN/Eddie + Mullvad + Tailscale (UFW + ipset + nft)"
+ :tags ["vpn" "firewall" "killswitch" "ufw" "iptables" "tailscale" "mullvad" "airvpn"]}
