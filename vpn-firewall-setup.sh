@@ -915,17 +915,41 @@ make_persistent() {
 
 # ---------- Tailscale subnet routing ----------
 #
-# When Mullvad is connected, its fwmark default-route rule (priority 5209)
-# catches any packet without explicit policy. Tailscale's own subnet routes
-# live in table 52 at priority 5270 (BELOW Mullvad), so packets to tailnet
-# CGNAT and advertised subnets get hijacked by Mullvad and dropped at the
-# exit (RFC1918) or rejected by Mullvad's nftables forward chain (CGNAT).
+# When Mullvad is connected, its fwmark default-route rule catches any packet
+# without explicit policy. Tailscale's own subnet routes live in table 52 at
+# priority 5270 (BELOW Mullvad), so packets to tailnet CGNAT and advertised
+# subnets get hijacked by Mullvad and dropped at the exit (RFC1918) or
+# rejected by Mullvad's nftables forward chain (CGNAT).
 #
 # These rules push table-52 lookups for those CIDRs ABOVE Mullvad's rule,
 # so host AND container traffic to tailnet destinations exit tailscale0.
-TAILSCALE_RULE_PRIO=5200
+#
+# Priority is detected at install time: we find Mullvad's fwmark rule
+# (mark 0x6d6f6c65 — "mole") and place ours one below. Mullvad app builds
+# have used different priorities over time (5199 today, 5209 historically),
+# so hardcoding is fragile. Fallback to TAILSCALE_RULE_PRIO_FALLBACK if
+# Mullvad isn't running at install time.
+TAILSCALE_RULE_PRIO_FALLBACK=5100
+TAILSCALE_RULE_PRIO=""   # populated by detect_tailscale_rule_prio
 TAILSCALE_ROUTE_TABLE=52
 TAILSCALE_ROUTES_UNIT=/etc/systemd/system/vpn-killswitch-tailscale-routes.service
+MULLVAD_FWMARK=0x6d6f6c65
+
+detect_tailscale_rule_prio() {
+    # Find Mullvad's fwmark default-route rule and place ours one below.
+    # `ip rule show` format: "<prio>:\t<selectors> lookup <table>"
+    local mullvad_prio
+    mullvad_prio=$(ip rule show 2>/dev/null \
+        | awk -v mark="$MULLVAD_FWMARK" '$0 ~ "fwmark " mark { sub(/:/,"",$1); print $1; exit }')
+
+    if [[ -n "$mullvad_prio" && "$mullvad_prio" =~ ^[0-9]+$ && "$mullvad_prio" -gt 1 ]]; then
+        TAILSCALE_RULE_PRIO=$((mullvad_prio - 1))
+        info "Mullvad fwmark rule at priority $mullvad_prio — placing Tailscale rules at $TAILSCALE_RULE_PRIO"
+    else
+        TAILSCALE_RULE_PRIO=$TAILSCALE_RULE_PRIO_FALLBACK
+        info "Mullvad fwmark rule not found — using fallback priority $TAILSCALE_RULE_PRIO"
+    fi
+}
 
 discover_tailscale_cidrs() {
     # CGNAT is always relevant if tailscale is in the picture.
@@ -945,16 +969,24 @@ install_tailscale_route_rules() {
     cidrs=$(discover_tailscale_cidrs | xargs)
     [[ -z "$cidrs" ]] && return 0
 
+    detect_tailscale_rule_prio
+
+    # Flush any stale rules left from previous installs at other priorities,
+    # so we don't accumulate duplicates whenever Mullvad's priority shifts.
+    for cidr in $cidrs; do
+        while ip rule del to "$cidr" lookup $TAILSCALE_ROUTE_TABLE 2>/dev/null; do :; done
+    done
+
     info "Installing Tailscale routing rules (priority $TAILSCALE_RULE_PRIO → table $TAILSCALE_ROUTE_TABLE):"
     for cidr in $cidrs; do
-        ip rule del to "$cidr" lookup $TAILSCALE_ROUTE_TABLE priority $TAILSCALE_RULE_PRIO 2>/dev/null || true
         ip rule add to "$cidr" lookup $TAILSCALE_ROUTE_TABLE priority $TAILSCALE_RULE_PRIO
         info "  $cidr"
     done
 
     # Persist via systemd oneshot. Re-applies at boot independent of UFW order.
-    # The CIDR list is baked in at install time — re-run the script (providers /
-    # auto / setup) to re-discover after adding tailnet subnet routers.
+    # The CIDR list AND priority are baked in at install time — re-run the
+    # script (providers / auto / setup) to re-discover after adding tailnet
+    # subnet routers OR after a Mullvad app update changes its rule priority.
     local exec_lines=""
     for cidr in $cidrs; do
         exec_lines+="ExecStart=-/sbin/ip rule del to $cidr lookup $TAILSCALE_ROUTE_TABLE priority $TAILSCALE_RULE_PRIO"$'\n'
@@ -963,7 +995,7 @@ install_tailscale_route_rules() {
 
     cat > "$TAILSCALE_ROUTES_UNIT" <<UNIT
 [Unit]
-Description=VPN Kill-Switch — Tailscale subnet route rules
+Description=VPN Kill-Switch — Tailscale subnet route rules (priority $TAILSCALE_RULE_PRIO)
 After=network-pre.target
 Before=network.target
 
@@ -981,13 +1013,26 @@ UNIT
 }
 
 remove_tailscale_route_rules() {
+    # Capture priority from the installed unit before deleting it, so we can
+    # flush the matching rules. Falls back to a sweep across all priorities
+    # we have ever used if the unit is gone or unparseable.
+    local prio=""
     if [[ -f "$TAILSCALE_ROUTES_UNIT" ]]; then
+        prio=$(awk '/^ExecStop=.*ip rule del priority/ {
+            for (i=1;i<=NF;i++) if ($i=="priority") { print $(i+1); exit }
+        }' "$TAILSCALE_ROUTES_UNIT")
         systemctl disable --now vpn-killswitch-tailscale-routes.service 2>/dev/null || true
         rm -f "$TAILSCALE_ROUTES_UNIT"
         systemctl daemon-reload 2>/dev/null || true
     fi
-    # Flush any rules still installed at our priority (covers stale CIDRs).
-    while ip rule del priority $TAILSCALE_RULE_PRIO 2>/dev/null; do :; done
+    if [[ -n "$prio" ]]; then
+        while ip rule del priority "$prio" 2>/dev/null; do :; done
+    else
+        # Sweep historical priorities (5100, 5200) in case the unit was already gone.
+        for p in 5100 5200; do
+            while ip rule del priority "$p" 2>/dev/null; do :; done
+        done
+    fi
 }
 
 install_nm_dispatcher() {
