@@ -34,6 +34,24 @@ PHYSICAL_IF=""
 # When set, VPN ports + HTTPS auth only allowed to these IPs (strict mode).
 VPN_ENDPOINTS="${VPN_ENDPOINTS:-}"
 
+# Optional: LAN CIDRs allowed to bypass the kill-switch on the physical IF.
+# Off by default — opt in per run. Use for management traffic to local
+# infra that shouldn't transit the VPN, e.g. Talos cluster apid (:50000)
+# on the cluster LAN, NAS, printer. Bidirectional ESTABLISHED is already
+# covered by conntrack; this opens NEW outbound to those CIDRs *and*
+# inbound from those CIDRs (so LAN devices can also initiate).
+#
+# Set via CLI flag (recommended):
+#   sudo ./vpn-firewall-setup.sh --lan 192.168.100.0/24 providers mullvad
+# Or via env var:
+#   sudo LAN_ALLOW_CIDRS="192.168.100.0/24 10.0.5.0/24" ./vpn-firewall-setup.sh ...
+# Multiple CIDRs: space-separated, quote the whole value.
+#
+# SECURITY: enabling this exposes your machine to LAN-initiated connections
+# on those CIDRs. Acceptable for a wired home LAN of known devices; risky
+# on shared/coworking/dorm LANs.
+LAN_ALLOW_CIDRS="${LAN_ALLOW_CIDRS:-}"
+
 BACKUP_DIR="/etc/ufw/backup-$(date +%Y%m%d-%H%M%S)"
 PROVIDERS_DIR="/etc/vpn-killswitch/providers"
 
@@ -830,6 +848,21 @@ add_killswitch_before_rules() {
 
 BEFORE
 
+    # --- LAN CIDR exceptions (e.g. cluster apid, NAS) ---
+    # These must precede the kill-switch DROP at the bottom of this file.
+    # Conntrack ESTABLISHED,RELATED is already accepted above, so return
+    # traffic for outbound flows works without an explicit input rule —
+    # we still emit the input rule to permit NEW inbound from same LAN
+    # (probes, mDNS, etc.) which the kill-switch would otherwise drop.
+    if [[ -n "$LAN_ALLOW_CIDRS" ]]; then
+        echo "# --- LAN allow-list ($LAN_ALLOW_CIDRS) ---" >> /etc/ufw/before.rules
+        for cidr in $LAN_ALLOW_CIDRS; do
+            echo "-A ufw-before-output -o $PHYSICAL_IF -d $cidr -j ACCEPT" >> /etc/ufw/before.rules
+            echo "-A ufw-before-input  -i $PHYSICAL_IF -s $cidr -j ACCEPT" >> /etc/ufw/before.rules
+        done
+        echo "" >> /etc/ufw/before.rules
+    fi
+
     if [[ -z "$VPN_ENDPOINTS" ]]; then
         cat >> /etc/ufw/before.rules <<BEFORE_DNS
 # --- DNS on physical IF (resolve VPN hosts) ---
@@ -1215,8 +1248,17 @@ Usage:
                                    Aliases: rescue, emergency
   $0 help                          Show this message
 
+Global flags (before the subcommand):
+  --lan <cidrs>                    Allow LAN traffic to/from these CIDRs to
+                                   bypass the killswitch on the physical IF.
+                                   Quote multi-value: --lan "192.168.100.0/24 10.0.5.0/24"
+                                   Use for cluster LAN, NAS, printer, etc.
+                                   SECURITY: opens machine to LAN-initiated
+                                   connections — wired-home OK, coworking risky.
+
 Env:
   VPN_ENDPOINTS="1.2.3.4 5.6.7.8"   Manual strict mode (overrides auto/providers)
+  LAN_ALLOW_CIDRS="192.168.100.0/24"   Same as --lan, env-var form.
 
 Providers:
   mullvad   — fetched from api.mullvad.net (needs jq + network)
@@ -1239,6 +1281,9 @@ Example workflows:
   # Always-on both providers:
   sudo $0 fetch mullvad airvpn
   sudo $0 providers mullvad airvpn
+
+  # Cluster-LAN management exception (Talos apid :50000, kubelet, etc.):
+  sudo $0 --lan 192.168.100.0/24 providers mullvad tailscale airvpn
 
   # Rollback:
   sudo $0 unlock
@@ -1347,5 +1392,22 @@ main() {
     info "Done. Reboot for full IPv6 disable."
     info "Rollback: sudo $0 unlock"
 }
+
+# --- Global flags (consumed before subcommand dispatch) ---
+# Currently: --lan / --lan-allow <cidrs>
+# Quote multi-CIDR values:  --lan "192.168.100.0/24 10.0.5.0/24"
+_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --lan|--lan-allow)
+            [[ $# -ge 2 ]] || error "$1 requires a CIDR (or quoted, space-separated CIDRs)"
+            LAN_ALLOW_CIDRS="$2"; shift 2 ;;
+        --lan=*|--lan-allow=*)
+            LAN_ALLOW_CIDRS="${1#*=}"; shift ;;
+        *)
+            _args+=("$1"); shift ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
 
 main "$@"
