@@ -84,6 +84,65 @@ sudo ./vpn-firewall-setup.sh providers myvpn
 
 Or implement a `fetch_myvpn()` function in the script for auto-refresh from your provider's API.
 
+## Per-domain split tunneling
+
+Run an auxiliary OpenVPN tunnel for a specific set of domains (e.g. an IP-allowlisted SaaS or a private corporate app) while the rest of egress stays on Mullvad / AirVPN / clearnet. The mechanism: dnsmasq tags DNS replies for the listed domains into an ipset, an iptables `mangle` rule marks packets to those IPs, an `ip rule` matches that mark and looks up a dedicated route table, and the auxiliary tunnel's `--up` hook installs `default dev <tun> table <N>` into that table.
+
+### Prerequisites
+
+- `dnsmasq` reachable as the system resolver. The `ipset=` directive is dnsmasq-specific. `systemd-resolved` alone is **not enough** — either install dnsmasq standalone or enable NetworkManager's dnsmasq plugin (`[main] dns=dnsmasq` in `/etc/NetworkManager/NetworkManager.conf`).
+- An OpenVPN config with a stable `--dev` name (so the up/down hooks target the right interface). The launcher pins `--dev` for you.
+
+### Config
+
+Drop a file at `/etc/vpn-killswitch/split/<name>.conf` (local — not git-tracked):
+
+```ini
+# /etc/vpn-killswitch/split/example.conf
+DOMAINS="*.example.com app.example.org"
+DEV=tun-example
+TABLE=142
+MARK=0x42
+PRIORITY=auto                       # 'auto' = below Tailscale's priority, or a number
+OVPN_CONFIG=/etc/openvpn/example.ovpn
+```
+
+### Use
+
+```bash
+sudo ./vpn-firewall-setup.sh split add example         # install ipset+mangle+ip rule+dnsmasq+systemd unit
+sudo ./vpn-firewall-setup.sh split list                # show all splits
+sudo ./vpn-firewall-setup.sh split status example      # ipset entries, route table, unit state
+sudo ./vpn-firewall-setup.sh split connect example     # launch openvpn with split-tunnel flags
+sudo ./vpn-firewall-setup.sh split rm example          # tear down (config left in place)
+```
+
+`split connect` wraps the launcher with `mullvad-exclude` when Mullvad is active, so the OpenVPN handshake bypasses Mullvad's fwmark default route. The launcher always sets `--route-nopull` and `pull-filter ignore "redirect-gateway"` so the auxiliary tunnel cannot hijack the main route.
+
+### What gets installed
+
+- ipset `vpnkis_split_<name>_dst` (hash:ip, 1h timeout — dnsmasq refreshes on each query)
+- iptables mangle rule in chain `VPNKIS-SPLIT`: `match-set <set> dst -j MARK --set-mark <MARK>`
+- `ip rule` at `PRIORITY`: `fwmark <MARK> lookup <TABLE>`
+- dnsmasq drop-in `/etc/dnsmasq.d/vpn-kis-split-<name>.conf`
+- systemd oneshot `vpn-killswitch-split-<name>.service` for boot persistence
+- openvpn up/down scripts at `/etc/vpn-killswitch/split/<name>.{up,down}.sh`
+
+`unlock` and `panic` clean all of the above.
+
+### Coexistence
+
+Split rules sit ~10 below the Tailscale rule priority (auto-detected from Mullvad's fwmark rule), so the precedence is:
+
+```
+<split>      fwmark 0x42  lookup 142   (priority ~5089)
+<tailscale>  to CGNAT/RFC1918 lookup 52 (priority ~5099)
+<mullvad>    fwmark 0x6d6f6c65 lookup … (priority ~5099)
+<main>       0/0 default                (priority 32766)
+```
+
+Set an explicit `PRIORITY=<N>` in the conf if you need a different ordering.
+
 ## Tailscale + Mullvad coexistence
 
 When both are active, Mullvad's `inet mullvad` nftables table installs `forward` policy `DROP` and a final `reject` rule — only `oif wg0-mullvad` is permitted. Tailscale CGNAT (`100.64.0.0/10`) gets rejected; tailnet RFC1918 subnets get hijacked by Mullvad's fwmark default route (priority 5209) and dropped at the exit.

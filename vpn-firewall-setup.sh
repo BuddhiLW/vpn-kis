@@ -358,6 +358,27 @@ panic_recover() {
     fi
     while ip rule del priority 5200 2>/dev/null; do :; done
 
+    # 4c. Remove split-tunnel units + ip rules + ipsets
+    echo "[*] Removing split-tunnel rules..."
+    if [ -d /etc/systemd/system ]; then
+        for u in /etc/systemd/system/vpn-killswitch-split-*.service; do
+            [ -f "$u" ] || continue
+            systemctl disable --now "$(basename "$u")" 2>/dev/null || true
+            rm -f "$u"
+        done
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    if command -v ipset >/dev/null 2>&1; then
+        ipset list -name 2>/dev/null | grep '^vpnkis_split_' | while read -r s; do
+            ipset destroy "$s" 2>/dev/null || true
+        done
+    fi
+    iptables -t mangle -F "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -D OUTPUT     -j "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -j "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
+    rm -f /etc/dnsmasq.d/vpn-kis-split-*.conf 2>/dev/null || true
+
     # 5. Re-enable IPv6 at runtime (sysctl files persist across reboot — see end)
     echo "[*] Re-enabling IPv6 (runtime only)..."
     for f in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
@@ -458,6 +479,7 @@ unlock_firewall() {
     rm -f /etc/ufw/before.init /etc/ipset.conf 2>/dev/null || true
 
     remove_tailscale_route_rules
+    split_remove_all
 
     ufw reload || warn "ufw reload failed"
 
@@ -1068,6 +1090,372 @@ remove_tailscale_route_rules() {
     fi
 }
 
+# ---------- Per-domain split tunneling ----------
+#
+# Route specific destination domains via a named auxiliary VPN tunnel while
+# the rest of egress keeps using whatever default (Mullvad, AirVPN, clearnet
+# via the killswitch). Useful for IP-allowlisted SaaS or private apps that
+# require a specific egress IP, without forcing all traffic through that VPN.
+#
+# How it works:
+#   1. dnsmasq is configured (drop-in) to tag DNS answers for the chosen
+#      domains: the resolved IPs land in an ipset named "vpnkis_split_<n>_dst".
+#   2. iptables mangle rule MARKs packets whose dst is in that ipset.
+#   3. `ip rule` at SPLIT_RULE_PRIO matches that mark and looks up table
+#      SPLIT_TABLE.
+#   4. When the auxiliary tunnel comes up, its --up hook installs a default
+#      route in table SPLIT_TABLE pointing at the tun device.
+#   5. Down hook flushes the table — packets fall through to the main route
+#      table (i.e. the default VPN/clearnet path).
+#
+# Config files (LOCAL, NOT git-tracked):
+#   /etc/vpn-killswitch/split/<name>.conf — keys (one per line):
+#     DOMAINS="*.example.com other.example.org"
+#     DEV=tun-<name>                 # must match the openvpn --dev pin
+#     TABLE=142                      # default if unset
+#     MARK=0x42                      # default if unset
+#     PRIORITY=auto                  # 'auto' = below tailscale, or a number
+#     OVPN_CONFIG=/path/to/file.ovpn # used by 'split connect <name>'
+#
+# Coexistence with Mullvad: the openvpn handshake must bypass Mullvad's
+# fwmark default route. `split connect <name>` wraps the launcher with
+# `mullvad-exclude` when available.
+
+SPLIT_CONF_DIR="/etc/vpn-killswitch/split"
+SPLIT_TABLE_DEFAULT=142
+SPLIT_MARK_DEFAULT="0x42"
+SPLIT_RULE_PRIO_FALLBACK=5090
+SPLIT_MANGLE_CHAIN="VPNKIS-SPLIT"
+
+# Populated by split_load_conf
+SPLIT_NAME=""
+SPLIT_DOMAINS=""
+SPLIT_DEV=""
+SPLIT_TABLE=""
+SPLIT_MARK=""
+SPLIT_PRIORITY=""
+SPLIT_OVPN_CONFIG=""
+
+split_ipset_name() { echo "vpnkis_split_${1}_dst"; }
+split_unit_name()  { echo "vpn-killswitch-split-${1}.service"; }
+split_unit_path()  { echo "/etc/systemd/system/$(split_unit_name "$1")"; }
+split_dnsmasq_path() { echo "/etc/dnsmasq.d/vpn-kis-split-${1}.conf"; }
+split_up_script()    { echo "$SPLIT_CONF_DIR/${1}.up.sh"; }
+split_down_script()  { echo "$SPLIT_CONF_DIR/${1}.down.sh"; }
+
+split_load_conf() {
+    local name="$1"
+    [[ -n "$name" ]] || error "split: name required"
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || error "split: name must match [a-zA-Z0-9_-]+"
+    local conf="$SPLIT_CONF_DIR/${name}.conf"
+    [[ -f "$conf" ]] || error "split: config not found: $conf"
+
+    # Safe key/value parser — no `source`. Trim whitespace + strip surrounding quotes.
+    local k v line
+    SPLIT_NAME="$name"
+    SPLIT_DOMAINS=""; SPLIT_DEV=""; SPLIT_TABLE=""; SPLIT_MARK=""
+    SPLIT_PRIORITY=""; SPLIT_OVPN_CONFIG=""
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+        k="${BASH_REMATCH[1]}"
+        v="${BASH_REMATCH[2]}"
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+        case "$k" in
+            DOMAINS)     SPLIT_DOMAINS="$v" ;;
+            DEV)         SPLIT_DEV="$v" ;;
+            TABLE)       SPLIT_TABLE="$v" ;;
+            MARK)        SPLIT_MARK="$v" ;;
+            PRIORITY)    SPLIT_PRIORITY="$v" ;;
+            OVPN_CONFIG) SPLIT_OVPN_CONFIG="$v" ;;
+        esac
+    done < "$conf"
+
+    [[ -n "$SPLIT_DOMAINS" ]] || error "split: DOMAINS empty in $conf"
+    [[ -n "$SPLIT_DEV" ]]     || error "split: DEV empty in $conf (must match openvpn --dev)"
+    SPLIT_TABLE="${SPLIT_TABLE:-$SPLIT_TABLE_DEFAULT}"
+    SPLIT_MARK="${SPLIT_MARK:-$SPLIT_MARK_DEFAULT}"
+    SPLIT_PRIORITY="${SPLIT_PRIORITY:-auto}"
+
+    if [[ "$SPLIT_PRIORITY" == "auto" ]]; then
+        if [[ -z "${TAILSCALE_RULE_PRIO:-}" ]]; then
+            detect_tailscale_rule_prio
+        fi
+        if [[ -n "$TAILSCALE_RULE_PRIO" && "$TAILSCALE_RULE_PRIO" -gt 11 ]]; then
+            SPLIT_PRIORITY=$((TAILSCALE_RULE_PRIO - 10))
+        else
+            SPLIT_PRIORITY=$SPLIT_RULE_PRIO_FALLBACK
+        fi
+    fi
+    [[ "$SPLIT_PRIORITY" =~ ^[0-9]+$ ]] || error "split: PRIORITY must be 'auto' or integer"
+}
+
+split_require_dnsmasq() {
+    [[ -d /etc/dnsmasq.d ]] || error "split: /etc/dnsmasq.d missing (apt install dnsmasq, or enable NM dnsmasq plugin)"
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null \
+        && [[ ! -f /etc/NetworkManager/conf.d/dnsmasq.conf ]] \
+        && ! systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        warn "split: systemd-resolved is the active resolver but no dnsmasq instance was detected."
+        warn "split: dnsmasq must front DNS for the ipset= directive to work. See README."
+    fi
+}
+
+split_install_ipset() {
+    command -v ipset >/dev/null 2>&1 || error "ipset required"
+    local set
+    set=$(split_ipset_name "$SPLIT_NAME")
+    ipset create "$set" hash:ip family inet hashsize 1024 maxelem 65536 timeout 3600 -exist
+}
+
+split_install_mangle() {
+    local set
+    set=$(split_ipset_name "$SPLIT_NAME")
+    # Use a single shared chain; per-split rules are individual append entries.
+    iptables -t mangle -N "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -C OUTPUT     -j "$SPLIT_MANGLE_CHAIN" 2>/dev/null \
+        || iptables -t mangle -A OUTPUT     -j "$SPLIT_MANGLE_CHAIN"
+    iptables -t mangle -C PREROUTING -j "$SPLIT_MANGLE_CHAIN" 2>/dev/null \
+        || iptables -t mangle -A PREROUTING -j "$SPLIT_MANGLE_CHAIN"
+
+    # Idempotent: delete any prior rule for this set, then re-add.
+    while iptables -t mangle -D "$SPLIT_MANGLE_CHAIN" -m set --match-set "$set" dst \
+        -j MARK --set-mark "$SPLIT_MARK" 2>/dev/null; do :; done
+    iptables -t mangle -A "$SPLIT_MANGLE_CHAIN" -m set --match-set "$set" dst \
+        -j MARK --set-mark "$SPLIT_MARK"
+}
+
+split_install_iprule() {
+    # Drop any stale rule at the same priority before adding (idempotent).
+    while ip rule del priority "$SPLIT_PRIORITY" 2>/dev/null; do :; done
+    ip rule add fwmark "$SPLIT_MARK" lookup "$SPLIT_TABLE" priority "$SPLIT_PRIORITY"
+}
+
+split_install_dnsmasq() {
+    split_require_dnsmasq
+    local set out
+    set=$(split_ipset_name "$SPLIT_NAME")
+    out=$(split_dnsmasq_path "$SPLIT_NAME")
+    {
+        echo "# Generated by vpn-firewall-setup.sh split add ${SPLIT_NAME}"
+        echo "# Domains routed via auxiliary tunnel ${SPLIT_DEV}"
+        local d
+        for d in $SPLIT_DOMAINS; do
+            echo "ipset=/${d#\*.}/${set}"
+        done
+    } > "$out"
+    # Reload dnsmasq if running. NM-managed dnsmasq reloads on SIGHUP.
+    if systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        systemctl reload dnsmasq 2>/dev/null || systemctl restart dnsmasq
+    elif pgrep -x dnsmasq >/dev/null 2>&1; then
+        pkill -HUP -x dnsmasq 2>/dev/null || true
+    fi
+}
+
+split_write_updown_scripts() {
+    local up down
+    up=$(split_up_script "$SPLIT_NAME")
+    down=$(split_down_script "$SPLIT_NAME")
+    cat > "$up" <<UP
+#!/bin/sh
+# openvpn --up hook for split '${SPLIT_NAME}'.
+# Args from openvpn: \$1=dev \$2=tun_mtu \$3=link_mtu \$4=ifconfig_local \$5=ifconfig_remote
+set -eu
+DEV="\${1:-${SPLIT_DEV}}"
+ip route replace default dev "\$DEV" table ${SPLIT_TABLE}
+logger -t vpn-kis-split "[${SPLIT_NAME}] route table ${SPLIT_TABLE} → \$DEV"
+UP
+    cat > "$down" <<DOWN
+#!/bin/sh
+# openvpn --down hook for split '${SPLIT_NAME}'.
+set -eu
+ip route flush table ${SPLIT_TABLE} 2>/dev/null || true
+logger -t vpn-kis-split "[${SPLIT_NAME}] route table ${SPLIT_TABLE} flushed"
+DOWN
+    chmod 755 "$up" "$down"
+}
+
+split_install_systemd() {
+    # Boot-persists the ip rule and mangle hookup (ipset is rehydrated by
+    # /etc/ufw/before.init from /etc/ipset.conf — we add this set there too).
+    local unit set
+    unit=$(split_unit_path "$SPLIT_NAME")
+    set=$(split_ipset_name "$SPLIT_NAME")
+    cat > "$unit" <<UNIT
+[Unit]
+Description=VPN Kill-Switch — split '${SPLIT_NAME}' (mark ${SPLIT_MARK} → table ${SPLIT_TABLE})
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/ipset create ${set} hash:ip family inet hashsize 1024 maxelem 65536 timeout 3600 -exist
+ExecStart=-/sbin/iptables -t mangle -N ${SPLIT_MANGLE_CHAIN}
+ExecStart=-/sbin/iptables -t mangle -C OUTPUT -j ${SPLIT_MANGLE_CHAIN}
+ExecStart=/bin/sh -c '/sbin/iptables -t mangle -C OUTPUT -j ${SPLIT_MANGLE_CHAIN} 2>/dev/null || /sbin/iptables -t mangle -A OUTPUT -j ${SPLIT_MANGLE_CHAIN}'
+ExecStart=/bin/sh -c '/sbin/iptables -t mangle -C PREROUTING -j ${SPLIT_MANGLE_CHAIN} 2>/dev/null || /sbin/iptables -t mangle -A PREROUTING -j ${SPLIT_MANGLE_CHAIN}'
+ExecStart=/bin/sh -c 'while /sbin/iptables -t mangle -D ${SPLIT_MANGLE_CHAIN} -m set --match-set ${set} dst -j MARK --set-mark ${SPLIT_MARK} 2>/dev/null; do :; done'
+ExecStart=/sbin/iptables -t mangle -A ${SPLIT_MANGLE_CHAIN} -m set --match-set ${set} dst -j MARK --set-mark ${SPLIT_MARK}
+ExecStart=/bin/sh -c 'while /sbin/ip rule del priority ${SPLIT_PRIORITY} 2>/dev/null; do :; done'
+ExecStart=/sbin/ip rule add fwmark ${SPLIT_MARK} lookup ${SPLIT_TABLE} priority ${SPLIT_PRIORITY}
+ExecStop=/bin/sh -c 'while /sbin/ip rule del priority ${SPLIT_PRIORITY} 2>/dev/null; do :; done'
+ExecStop=-/sbin/iptables -t mangle -D ${SPLIT_MANGLE_CHAIN} -m set --match-set ${set} dst -j MARK --set-mark ${SPLIT_MARK}
+ExecStop=-/sbin/ip route flush table ${SPLIT_TABLE}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable "$(split_unit_name "$SPLIT_NAME")" >/dev/null 2>&1 || true
+}
+
+split_install() {
+    require_root
+    split_load_conf "$1"
+    info "Installing split '$SPLIT_NAME': domains=[$SPLIT_DOMAINS] dev=$SPLIT_DEV table=$SPLIT_TABLE mark=$SPLIT_MARK priority=$SPLIT_PRIORITY"
+    split_install_ipset
+    split_install_mangle
+    split_install_iprule
+    split_install_dnsmasq
+    split_write_updown_scripts
+    split_install_systemd
+    info "Split '$SPLIT_NAME' installed. Bring the tunnel up with:"
+    info "  sudo $0 split connect $SPLIT_NAME"
+}
+
+split_remove() {
+    require_root
+    local name="$1"
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || error "split: invalid name"
+    local set conf unit dns up down
+    set=$(split_ipset_name "$name")
+    conf="$SPLIT_CONF_DIR/${name}.conf"
+    unit=$(split_unit_path "$name")
+    dns=$(split_dnsmasq_path "$name")
+    up=$(split_up_script "$name")
+    down=$(split_down_script "$name")
+
+    # Discover this split's priority+mark from its unit file before we destroy it,
+    # so we can flush the rule even if the conf is gone.
+    local prio="" mark=""
+    if [[ -f "$unit" ]]; then
+        prio=$(awk '/ExecStart=.*ip rule add/ { for(i=1;i<=NF;i++) if($i=="priority"){print $(i+1);exit} }' "$unit")
+        mark=$(awk '/ExecStart=.*ip rule add/ { for(i=1;i<=NF;i++) if($i=="fwmark"){print $(i+1);exit} }' "$unit")
+        systemctl disable --now "$(split_unit_name "$name")" 2>/dev/null || true
+        rm -f "$unit"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    if [[ -n "$prio" ]]; then
+        while ip rule del priority "$prio" 2>/dev/null; do :; done
+    fi
+    if [[ -n "$mark" ]]; then
+        while iptables -t mangle -D "$SPLIT_MANGLE_CHAIN" \
+            -m set --match-set "$set" dst -j MARK --set-mark "$mark" 2>/dev/null; do :; done
+    fi
+    ipset destroy "$set" 2>/dev/null || true
+    rm -f "$dns" "$up" "$down"
+
+    if systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        systemctl reload dnsmasq 2>/dev/null || systemctl restart dnsmasq
+    elif pgrep -x dnsmasq >/dev/null 2>&1; then
+        pkill -HUP -x dnsmasq 2>/dev/null || true
+    fi
+
+    info "Split '$name' removed. Config left at $conf (delete manually if no longer needed)."
+}
+
+split_remove_all() {
+    [[ -d "$SPLIT_CONF_DIR" ]] || return 0
+    local f name
+    for f in "$SPLIT_CONF_DIR"/*.conf; do
+        [[ -f "$f" ]] || continue
+        name=$(basename "$f" .conf)
+        split_remove "$name" || true
+    done
+    # Tear down the shared chain itself when the last split goes away.
+    if ! ls "$SPLIT_CONF_DIR"/*.conf >/dev/null 2>&1; then
+        iptables -t mangle -D OUTPUT     -j "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
+        iptables -t mangle -D PREROUTING -j "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
+        iptables -t mangle -F "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
+        iptables -t mangle -X "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
+    fi
+}
+
+split_list() {
+    if [[ ! -d "$SPLIT_CONF_DIR" ]] || ! ls "$SPLIT_CONF_DIR"/*.conf >/dev/null 2>&1; then
+        info "No splits configured. Drop a config at $SPLIT_CONF_DIR/<name>.conf — see README."
+        return 0
+    fi
+    local f name
+    for f in "$SPLIT_CONF_DIR"/*.conf; do
+        name=$(basename "$f" .conf)
+        if [[ -f "$(split_unit_path "$name")" ]]; then
+            printf "  %-20s  installed (unit: %s)\n" "$name" "$(split_unit_name "$name")"
+        else
+            printf "  %-20s  configured (run: %s split add %s)\n" "$name" "$0" "$name"
+        fi
+    done
+}
+
+split_status() {
+    local name="$1"
+    [[ -n "$name" ]] || { split_list; return 0; }
+    split_load_conf "$name"
+    local set
+    set=$(split_ipset_name "$name")
+    info "Split '$name':"
+    info "  domains   : $SPLIT_DOMAINS"
+    info "  dev       : $SPLIT_DEV"
+    info "  table     : $SPLIT_TABLE"
+    info "  mark      : $SPLIT_MARK"
+    info "  priority  : $SPLIT_PRIORITY"
+    info "  ovpn      : ${SPLIT_OVPN_CONFIG:-(unset)}"
+    echo ""
+    info "ipset $set:"
+    ipset list "$set" 2>/dev/null | sed 's/^/  /' || warn "  ipset $set not present"
+    echo ""
+    info "ip rule:"
+    ip rule show priority "$SPLIT_PRIORITY" 2>/dev/null | sed 's/^/  /' || true
+    echo ""
+    info "route table $SPLIT_TABLE:"
+    ip route show table "$SPLIT_TABLE" 2>/dev/null | sed 's/^/  /' || true
+    echo ""
+    info "systemd unit:"
+    systemctl is-enabled "$(split_unit_name "$name")" 2>&1 | sed 's/^/  enabled: /'
+    systemctl is-active  "$(split_unit_name "$name")" 2>&1 | sed 's/^/  active : /'
+}
+
+split_connect() {
+    require_root
+    split_load_conf "$1"
+    [[ -n "$SPLIT_OVPN_CONFIG" ]] || error "split connect: OVPN_CONFIG not set in $SPLIT_CONF_DIR/${SPLIT_NAME}.conf"
+    [[ -f "$SPLIT_OVPN_CONFIG" ]] || error "split connect: OVPN_CONFIG not found: $SPLIT_OVPN_CONFIG"
+    command -v openvpn >/dev/null 2>&1 || error "openvpn not installed"
+
+    local launcher=()
+    if command -v mullvad-exclude >/dev/null 2>&1 \
+        && mullvad status 2>/dev/null | grep -qi connected; then
+        info "Mullvad active — wrapping with mullvad-exclude"
+        launcher=(mullvad-exclude)
+    fi
+
+    info "Connecting split '$SPLIT_NAME' (dev=$SPLIT_DEV, config=$SPLIT_OVPN_CONFIG)"
+    info "Default route will NOT be hijacked (route-nopull). Route table $SPLIT_TABLE handles split traffic."
+
+    exec "${launcher[@]}" openvpn \
+        --config "$SPLIT_OVPN_CONFIG" \
+        --dev "$SPLIT_DEV" \
+        --pull-filter ignore "redirect-gateway" \
+        --pull-filter ignore "dhcp-option DNS" \
+        --route-nopull \
+        --script-security 2 \
+        --up "$(split_up_script "$SPLIT_NAME")" \
+        --down "$(split_down_script "$SPLIT_NAME")"
+}
+
 install_nm_dispatcher() {
     # Re-apply firewall when physical IF changes (wifi↔ethernet, dock, etc.)
     if [[ ! -d /etc/NetworkManager/dispatcher.d ]]; then
@@ -1241,6 +1629,14 @@ Usage:
                                    passive = non-disruptive rule checks
                                    active  = drops VPN, checks for leak, reconnects
                                    FORCE=1 skips confirm prompt
+  $0 split add <name>              Install per-domain split tunnel
+                                   (reads $SPLIT_CONF_DIR/<name>.conf)
+  $0 split rm <name>               Remove split (ip rule, mangle, dnsmasq drop-in, unit)
+  $0 split list                    List configured/installed splits
+  $0 split status [name]           Show ipset, route table, unit state
+  $0 split connect <name>          Launch openvpn with split-tunnel flags
+                                   (route-nopull, --dev pin, up/down hooks,
+                                   wraps with mullvad-exclude if Mullvad up)
   $0 unlock                        Restore UFW from latest backup
   $0 panic                         EMERGENCY: drop all firewall rules, reset
                                    DNS, re-enable IPv6, restart network stack.
@@ -1318,6 +1714,28 @@ main() {
         panic|rescue|emergency)
             require_root
             panic_recover
+            exit 0 ;;
+        split)
+            local sub="${1:-list}"
+            shift || true
+            case "$sub" in
+                add|install)
+                    [[ $# -ge 1 ]] || error "split add: name required"
+                    split_install "$1" ;;
+                rm|remove|del|delete)
+                    require_root
+                    [[ $# -ge 1 ]] || error "split rm: name required"
+                    split_remove "$1" ;;
+                ls|list)
+                    split_list ;;
+                status)
+                    split_status "${1:-}" ;;
+                connect|up)
+                    [[ $# -ge 1 ]] || error "split connect: name required"
+                    split_connect "$1" ;;
+                *)
+                    error "split: unknown subcommand '$sub'. Try: add|rm|list|status|connect" ;;
+            esac
             exit 0 ;;
         test)
             require_root
