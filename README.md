@@ -84,6 +84,22 @@ sudo ./vpn-firewall-setup.sh providers myvpn
 
 Or implement a `fetch_myvpn()` function in the script for auto-refresh from your provider's API.
 
+If the provider is one of your split-tunnel configs (`/etc/vpn-killswitch/split/<name>.conf` with `OVPN_CONFIG=` set), `fetch <name>` works out of the box: it extracts the `.ovpn` `remote` hosts, resolves them, and merges with the cached list. This is the right shape for corporate servers behind dynamic IPs / DDNS.
+
+## Endpoint auto-refresh (dynamic-IP servers)
+
+Strict mode whitelists the IPs known at lock time. A server behind a dynamic IP eventually moves; the killswitch then drops OpenVPN's own packets and the log fills with `write UDPv4: Operation not permitted`. Fix is `refresh`:
+
+```bash
+sudo ./vpn-firewall-setup.sh refresh                 # re-fetch last-used providers, swap ipset atomically
+sudo ./vpn-firewall-setup.sh refresh install 15min   # systemd timer doing the above forever
+sudo ./vpn-firewall-setup.sh refresh uninstall       # remove the timer
+```
+
+`refresh` rebuilds the `vpn_endpoints` ipset with `ipset swap` — one kernel op, no UFW reload, no window where the whitelist is empty. The provider list comes from the last `providers` run (`/etc/vpn-killswitch/providers.active`).
+
+So DNS resolution keeps working while the VPN is down, a few public resolvers (`1.1.1.1 8.8.8.8 9.9.9.9`) are added to the endpoint set — strict mode then allows 53/udp to those resolvers only. Trade-off: with the VPN down, those DNS queries are visible to the ISP. Opt out with `DNS_BOOTSTRAP_IPS=""` in env (refresh will then only work while a tunnel is up).
+
 ## Per-domain split tunneling
 
 Run an auxiliary OpenVPN tunnel for a specific set of domains (e.g. an IP-allowlisted SaaS or a private corporate app) while the rest of egress stays on Mullvad / AirVPN / clearnet. The mechanism: dnsmasq tags DNS replies for the listed domains into an ipset, an iptables `mangle` rule marks packets to those IPs, an `ip rule` matches that mark and looks up a dedicated route table, and the auxiliary tunnel's `--up` hook installs `default dev <tun> table <N>` into that table.
@@ -186,3 +202,60 @@ If you lock yourself out:
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+## OpenClaw HTTPS with Mullvad active
+
+If `<host>.<tailnet>.ts.net` returns NXDOMAIN and even `curl --resolve`
+cannot connect, route priority alone is insufficient: Mullvad rejects unmarked
+Tailscale traffic, and this workstation deliberately disables Tailscale DNS.
+The initial `tailscale-web` profile is restricted to this OpenClaw endpoint.
+Your normal combined provider command enables it automatically:
+
+```sh
+sudo ./vpn-firewall-setup.sh providers mullvad tailscale airvpn
+```
+
+The existing Tailscale routing service reapplies it at boot and network retargets.
+To apply just this fix now, without rebuilding your kill-switch:
+
+```sh
+sudo ./vpn-firewall-setup.sh tailscale-web apply
+# Expected: HTTPS status: 200. Then reload the browser.
+```
+
+It verifies the pinned IPv4 address against the live Tailscale peer identity and
+requires a route through `tailscale0`. A separate nftables table marks only TCP
+443 to that address on that interface with Mullvad's permitted conntrack mark.
+It does not set a routing meta mark, open the full tailnet CIDR, exclude a browser,
+or modify Mullvad's own table. Replies inherit the connection mark. The exception
+also permits this selected Tailscale flow while Mullvad is in its blocked state.
+A single managed `/etc/hosts` mapping avoids changing global DNS settings; HTTPS
+still validates the original hostname/certificate. Conflicting hosts entries or
+changed peer addresses fail before applying changes. This relies on Tailscale's
+identity/routing and the gateway's own authentication, not the IP alone.
+
+The combined provider workflow records `/etc/vpn-killswitch/tailscale-web.enabled`
+and restores the firewall rule using the existing Tailscale boot service. If the
+peer/route is not ready at boot, it reports a warning; rerun `tailscale-routes apply`
+when Tailscale is ready. Standalone `tailscale-web apply` only applies the runtime
+rule and hostname mapping; it does not enable boot persistence. No firewall or
+resolver change has been applied by the code update itself. Root activation and
+live verification remain required. If HTTPS verification fails, changes remain
+for diagnosis. `unlock`, `panic`, and `tailscale-routes remove` clean up this
+profile. To disable its boot marker and remove its current rule/hosts entry:
+
+```sh
+sudo ./vpn-firewall-setup.sh tailscale-web remove
+```
+
+Removal touches only its dedicated table and exact managed hosts line. Existing
+connections may retain their conntrack mark until closed. This does not change
+phone settings, tailnet grants, OpenClaw credentials, or model configuration.
+
+Reference: [Mullvad's documented conntrack-mark exception](https://mullvad.net/en/help/split-tunneling-with-linux-advanced).
+
+Developer checks: `bash -n vpn-firewall-setup.sh` and
+`python3 -m unittest discover -s tests`. The helper tests mock privileged commands;
+they do not establish live kernel filtering. Root activation runs `nft --check`
+before loading the rules and tests HTTPS without skipping certificate validation.

@@ -17,9 +17,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-info()  { printf "${GREEN}[+]${NC} %s\n" "$*"; }
-warn()  { printf "${YELLOW}[!]${NC} %s\n" "$*"; }
-error() { printf "${RED}[-]${NC} %s\n" "$*"; exit 1; }
+info()  { printf "${GREEN}[+]${NC} %s\n" "$*" >&2; }
+warn()  { printf "${YELLOW}[!]${NC} %s\n" "$*" >&2; }
+error() { printf "${RED}[-]${NC} %s\n" "$*" >&2; exit 1; }
 
 VPN_INTERFACES="${VPN_IFACES:-tun+ wg+ Eddie ppp+ tailscale0}"
 # 1194 OpenVPN, 443 OpenVPN-TCP-fallback, 53 AirVPN-DNS-tunnel, 51820 WireGuard,
@@ -55,10 +55,50 @@ LAN_ALLOW_CIDRS="${LAN_ALLOW_CIDRS:-}"
 BACKUP_DIR="/etc/ufw/backup-$(date +%Y%m%d-%H%M%S)"
 PROVIDERS_DIR="/etc/vpn-killswitch/providers"
 
+# Public resolvers added to the endpoint ipset in strict mode so 'refresh'
+# can re-resolve provider hostnames even while the VPN is down (53/udp is in
+# VPN_PORTS_UDP, so strict rules allow DNS to ipset members only).
+# Trade-off: DNS to these resolvers is visible to the ISP when the VPN is
+# down. Opt out with DNS_BOOTSTRAP_IPS="" in env.
+DNS_BOOTSTRAP_IPS="${DNS_BOOTSTRAP_IPS-1.1.1.1 8.8.8.8 9.9.9.9}"
+
+# Provider names from the last 'providers' run — consumed by 'refresh' so
+# the timer knows what to re-fetch without re-stating the list.
+PROVIDERS_ACTIVE_FILE="/etc/vpn-killswitch/providers.active"
+REFRESH_SERVICE=/etc/systemd/system/vpn-killswitch-refresh.service
+REFRESH_TIMER=/etc/systemd/system/vpn-killswitch-refresh.timer
+
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         error "Run as root or with sudo"
     fi
+}
+
+# Read-only iptables view. Returns the first backend that can render the
+# request; prints nothing and returns 1 if none can.
+# READ ONLY — rule *writes* must keep using the bare `iptables` alternatives
+# default, the same backend UFW restores into.
+ipt_ro() {
+    local cand
+    for cand in iptables iptables-nft iptables-legacy; do
+        command -v "$cand" >/dev/null 2>&1 || continue
+        command "$cand" "$@" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# Print up to 20 lines of a filter-table chain, or explain why it can't be
+# rendered. Never fails the caller.
+show_filter_chain() {
+    local chain="$1" out
+    if out=$(ipt_ro -L "$chain" -n -v) && [[ -n "$out" ]]; then
+        printf '%s\n' "$out" | head -20
+        return 0
+    fi
+    warn "No iptables backend can render filter/$chain."
+    warn "Mixed legacy+nft tables, or a native nft ruleset owns the table."
+    warn "Inspect with: nft list chain ip filter $chain"
+    nft list chain ip filter "$chain" 2>/dev/null | head -20 || true
 }
 
 # ---------- Provider fetchers ----------
@@ -221,15 +261,73 @@ fetch_tailscale() {
     echo "$ips $prev_ips" | tr ' ' '\n' | sort -u | grep -vE '^\s*$'
 }
 
+# Generic fetcher for custom providers backed by a split-tunnel config:
+# reads OVPN_CONFIG from /etc/vpn-killswitch/split/<name>.conf (or
+# <name>-vpn.conf), extracts `remote <host>` directives and resolves them.
+# Hostnames behind dynamic IPs (DDNS) get re-resolved on every fetch — pair
+# with 'refresh install' so the ipset tracks IP changes automatically.
+# Merges with the cached list: old IPs stay allowed during DNS propagation.
+fetch_split_remotes() {
+    local name="$1" conf="" c
+    for c in "$SPLIT_CONF_DIR/${name}.conf" "$SPLIT_CONF_DIR/${name}-vpn.conf" "$SPLIT_CONF_DIR/vpn-${name}.conf"; do
+        [[ -f "$c" ]] && { conf="$c"; break; }
+    done
+    [[ -n "$conf" ]] || return 1
+
+    local ovpn
+    ovpn=$(awk -F'=' '/^[[:space:]]*OVPN_CONFIG[[:space:]]*=/ {
+        v=$2; gsub(/^[[:space:]"\047]+|[[:space:]"\047]+$/, "", v); print v; exit }' "$conf")
+    [[ -n "$ovpn" && -f "$ovpn" ]] || { warn "$conf: no readable OVPN_CONFIG"; return 1; }
+
+    local remotes
+    remotes=$(grep -hE '^\s*remote\s+\S+' "$ovpn" 2>/dev/null | awk '{print $2}' | sort -u)
+    [[ -n "$remotes" ]] || { warn "no 'remote' directives in $ovpn"; return 1; }
+
+    local ips="" target host_ips r
+    for target in $remotes; do
+        if [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ips="$ips $target"
+            continue
+        fi
+        # System resolver first (works when VPN/dnsmasq up); direct public
+        # resolvers as fallback — they are in the endpoint ipset (see
+        # DNS_BOOTSTRAP_IPS) so this works even with the VPN down.
+        for r in "" "@1.1.1.1" "@8.8.8.8"; do
+            if command -v dig >/dev/null 2>&1; then
+                host_ips=$(dig +short +time=2 +tries=1 $r "$target" A 2>/dev/null \
+                          | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+            else
+                host_ips=$(getent ahosts "$target" 2>/dev/null \
+                          | awk '/STREAM/ {print $1}' | grep -E '^[0-9]+\.' || true)
+                ips="$ips $host_ips"
+                break   # getent has no @server form — one shot only
+            fi
+            [[ -n "$host_ips" ]] && { ips="$ips $host_ips"; break; }
+        done
+    done
+
+    local prev="$PROVIDERS_DIR/${name}.ips" prev_ips=""
+    [[ -f "$prev" ]] && prev_ips=$(grep -vE '^\s*(#|$)' "$prev" 2>/dev/null || true)
+
+    echo "$ips $prev_ips" | tr ' ' '\n' | sort -u | grep -vE '^\s*$'
+}
+
 fetch_provider() {
     local name="$1"
     local fn="fetch_$name"
-    if ! declare -F "$fn" >/dev/null 2>&1; then
-        error "Unknown provider: $name. Known: $(declare -F | awk '/fetch_[a-z]/ {sub(/fetch_/,"",$3); print $3}' | grep -v '^provider$' | xargs)"
-    fi
     info "Fetching $name server IPs..."
     local ips
-    ips=$("$fn") || { warn "Fetch failed for $name"; return 1; }
+    if declare -F "$fn" >/dev/null 2>&1; then
+        ips=$("$fn") || { warn "Fetch failed for $name"; return 1; }
+    elif ips=$(fetch_split_remotes "$name"); then
+        info "$name: resolved from split config remotes"
+    elif [[ -f "$PROVIDERS_DIR/$name.ips" ]]; then
+        # Static hand-maintained list — nothing to fetch, cache stays as-is.
+        warn "$name: no fetcher and no split config — keeping static $PROVIDERS_DIR/$name.ips"
+        return 0
+    else
+        error "Unknown provider: $name. Known: $(declare -F | awk '/fetch_[a-z]/ {sub(/fetch_/,"",$3); print $3}' | grep -v '^provider$' | xargs). Custom: drop IPs into $PROVIDERS_DIR/$name.ips, or create a split config with OVPN_CONFIG."
+    fi
     [[ -z "${ips// }" ]] && { warn "No IPs returned for $name"; return 1; }
 
     mkdir -p "$PROVIDERS_DIR"
@@ -349,6 +447,7 @@ panic_recover() {
     rm -f /etc/NetworkManager/dispatcher.d/90-vpn-killswitch 2>/dev/null || true
     rm -f /etc/ufw/before.init 2>/dev/null || true
 
+    remove_tailscale_web
     # 4b. Remove tailscale route rules + boot-persistence unit
     echo "[*] Removing Tailscale routing rules..."
     if [ -f /etc/systemd/system/vpn-killswitch-tailscale-routes.service ]; then
@@ -357,6 +456,8 @@ panic_recover() {
         systemctl daemon-reload 2>/dev/null || true
     fi
     while ip rule del priority 5200 2>/dev/null; do :; done
+    remove_tailscale_nft
+    remove_tailscaled_dropin
 
     # 4c. Remove split-tunnel units + ip rules + ipsets
     echo "[*] Removing split-tunnel rules..."
@@ -378,6 +479,30 @@ panic_recover() {
     iptables -t mangle -D PREROUTING -j "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
     iptables -t mangle -X "$SPLIT_MANGLE_CHAIN" 2>/dev/null || true
     rm -f /etc/dnsmasq.d/vpn-kis-split-*.conf 2>/dev/null || true
+
+    # 4c-bis. Remove cgroup-based VPN-exclude routing + unit + cgroup
+    echo "[*] Removing VPN-exclude rules..."
+    if [ -f "$EXCLUDE_UNIT" ]; then
+        systemctl disable --now vpn-killswitch-exclude.service 2>/dev/null || true
+        rm -f "$EXCLUDE_UNIT"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    while ip rule del priority "$EXCLUDE_PRIO" 2>/dev/null; do :; done
+    ip route flush table "$EXCLUDE_TABLE" 2>/dev/null || true
+    iptables -t mangle -F "$EXCLUDE_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -j "$EXCLUDE_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$EXCLUDE_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$EXCLUDE_NAT_CHAIN" 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -j "$EXCLUDE_NAT_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$EXCLUDE_NAT_CHAIN" 2>/dev/null || true
+    rmdir "$EXCLUDE_CGROUP" 2>/dev/null || true
+
+    # 4d. Remove endpoint-refresh timer
+    echo "[*] Removing endpoint-refresh timer..."
+    systemctl disable --now vpn-killswitch-refresh.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/vpn-killswitch-refresh.timer \
+          /etc/systemd/system/vpn-killswitch-refresh.service 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
 
     # 5. Re-enable IPv6 at runtime (sysctl files persist across reboot — see end)
     echo "[*] Re-enabling IPv6 (runtime only)..."
@@ -429,7 +554,7 @@ EOF
     # 10. Show final firewall state for sanity
     echo ""
     echo "[*] Current iptables OUTPUT policy:"
-    iptables -L OUTPUT -n | head -3 2>/dev/null || echo "    (iptables unreadable)"
+    ipt_ro -L OUTPUT -n | head -3 || echo "    (iptables unreadable)"
 
     cat <<'NOTE'
 
@@ -479,7 +604,9 @@ unlock_firewall() {
     rm -f /etc/ufw/before.init /etc/ipset.conf 2>/dev/null || true
 
     remove_tailscale_route_rules
+    remove_refresh_timer
     split_remove_all
+    exclude_remove_all
 
     ufw reload || warn "ufw reload failed"
 
@@ -532,7 +659,7 @@ test_passive() {
 
     # 3. Kill-switch DROP rule on physical IF present?
     detect_physical_if >/dev/null 2>&1 || true
-    if iptables -S ufw-before-output 2>/dev/null | grep -qE -- "-o $PHYSICAL_IF .*-j DROP"; then
+    if ipt_ro -S ufw-before-output | grep -qE -- "-o $PHYSICAL_IF .*-j DROP"; then
         pass "Physical IF DROP rule present ($PHYSICAL_IF)"
     else
         fail "No DROP rule on $PHYSICAL_IF in ufw-before-output — killswitch will NOT fire"
@@ -540,7 +667,7 @@ test_passive() {
 
     # 4. VPN iface allowed?
     local allowed_vifs
-    allowed_vifs=$(iptables -S ufw-before-output 2>/dev/null | grep -oE -- "-o \S+ -j ACCEPT" | awk '{print $2}' | sort -u | tr '\n' ' ')
+    allowed_vifs=$(ipt_ro -S ufw-before-output | grep -oE -- "-o \S+ -j ACCEPT" | awk '{print $2}' | sort -u | tr '\n' ' ' || true)
     if [[ -n "$allowed_vifs" ]]; then
         pass "VPN interfaces ACCEPT: $allowed_vifs"
     else
@@ -548,7 +675,9 @@ test_passive() {
     fi
 
     # 5. IPv6 disabled?
-    if [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == "1" ]]; then
+    if [[ ! -e /proc/sys/net/ipv6 ]]; then
+        pass "IPv6 stack absent (module never loaded)"
+    elif [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == "1" ]]; then
         pass "IPv6 disabled"
     else
         fail "IPv6 still enabled (reboot may be required)"
@@ -563,8 +692,8 @@ test_passive() {
 
     # 7. Strict mode check (are endpoint IPs locked via -d or ipset?)
     local strict_rules ipset_count ipset_ok=0
-    strict_rules=$(iptables -S ufw-before-output 2>/dev/null | grep -cE -- "-d [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*ACCEPT" || true)
-    if iptables -S ufw-before-output 2>/dev/null | grep -q "match-set vpn_endpoints"; then
+    strict_rules=$(ipt_ro -S ufw-before-output | grep -cE -- "-d [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*ACCEPT" || true)
+    if ipt_ro -S ufw-before-output | grep -q "match-set vpn_endpoints"; then
         ipset_count=$(ipset list vpn_endpoints 2>/dev/null | awk '/Number of entries:/ {print $NF}')
         if [[ -n "$ipset_count" && "$ipset_count" -gt 0 ]]; then
             pass "Strict mode active: ipset 'vpn_endpoints' with $ipset_count IPs"
@@ -661,7 +790,7 @@ test_active() {
 
     if dig +time=3 +tries=1 google.com @8.8.8.8 +short >/dev/null 2>&1; then
         # permissive mode allows DNS → not a leak per se but noted
-        if iptables -S ufw-before-output | grep -qE -- "--dport 53.*ACCEPT"; then
+        if ipt_ro -S ufw-before-output | grep -qE -- "--dport 53.*ACCEPT"; then
             skip "DNS @8.8.8.8 reached (permissive mode allows DNS to any host)"
         else
             fail "DNS @8.8.8.8 resolved (LEAK — DNS rule shouldn't allow this)"
@@ -721,7 +850,10 @@ net.ipv6.conf.all.forwarding = 0
 net.ipv6.conf.default.forwarding = 0
 EOF
 
+    # Whole tree is absent when the ipv6 module never loaded (ipv6.disable=1
+    # already on the kernel cmdline); the glob then stays literal.
     for iface in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+        [[ -w "$iface" ]] || continue
         echo 1 > "$iface" 2>/dev/null || true
     done
     sysctl --system > /dev/null 2>&1
@@ -757,9 +889,12 @@ setup_endpoint_ipset() {
     ipset destroy vpn_endpoints 2>/dev/null || true
 
     # Bulk load via restore (single syscall batch)
+    # DNS_BOOTSTRAP_IPS included so 'refresh' can resolve provider hostnames
+    # while the VPN is down (strict mode allows 53/udp to set members only).
     {
         echo "create vpn_endpoints hash:ip family inet hashsize 2048 maxelem 65536"
-        for ip in $VPN_ENDPOINTS; do
+        for ip in $VPN_ENDPOINTS $DNS_BOOTSTRAP_IPS; do
+            [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { warn "Skipping non-IPv4 endpoint: $ip"; continue; }
             echo "add vpn_endpoints $ip"
         done
     } | ipset restore -exist
@@ -933,6 +1068,9 @@ BEFORE_DNS
         echo "-A ufw-before-forward -o $vif -j ACCEPT" >> /etc/ufw/before.rules
     done
 
+    # --- Owner-based VPN exclusion: ACCEPT excluded users before the DROP ---
+    exclude_emit_before_rules_block "$PHYSICAL_IF" >> /etc/ufw/before.rules
+
     cat >> /etc/ufw/before.rules <<'BEFORE2'
 
 # --- KILL-SWITCH: drop anything else on physical IF ---
@@ -989,6 +1127,19 @@ TAILSCALE_RULE_PRIO=""   # populated by detect_tailscale_rule_prio
 TAILSCALE_ROUTE_TABLE=52
 TAILSCALE_ROUTES_UNIT=/etc/systemd/system/vpn-killswitch-tailscale-routes.service
 MULLVAD_FWMARK=0x6d6f6c65
+MULLVAD_CT_MARK=0x00000f41
+TAILSCALE_NFT_TABLE=vpn-killswitch-tailscale
+TAILSCALED_DROPIN=/etc/systemd/system/tailscaled.service.d/50-vpn-killswitch-mullvad.conf
+TAILSCALE_WEB_ENABLED=/etc/vpn-killswitch/tailscale-web.enabled
+
+tailscale_web_helper() {
+    python3 "$(dirname "$(readlink -f "$0")")/lib/tailscale-web/configure.py" "$@"
+}
+
+remove_tailscale_web() {
+    rm -f "$TAILSCALE_WEB_ENABLED"
+    tailscale_web_helper remove || warn "Could not fully remove the OpenClaw client exception."
+}
 
 detect_tailscale_rule_prio() {
     # Find Mullvad's fwmark default-route rule and place ours one below.
@@ -1011,83 +1162,165 @@ discover_tailscale_cidrs() {
     echo "100.64.0.0/10"
     # Plus any RFC1918 subnets currently advertised through tailscale0
     # (k8s pod/service CIDRs from subnet routers, home-lab subnets, etc.).
-    ip route show table $TAILSCALE_ROUTE_TABLE 2>/dev/null \
-        | awk '/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.).*\/[0-9]+ dev tailscale/ {print $1}' \
+    # tailscaled.service can be active before it creates table 52. `ip` then
+    # exits 2; tolerate that expected early-boot state so `set -e -o pipefail`
+    # does not abort the oneshot before it installs the CGNAT fallback rule.
+    { ip route show table "$TAILSCALE_ROUTE_TABLE" 2>/dev/null || true; } \
+        | awk '$2 == "dev" && $3 ~ /^tailscale/ &&
+               $1 ~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ {print $1}' \
         | sort -u
 }
 
-install_tailscale_route_rules() {
-    # Skip if tailscale isn't part of this killswitch profile.
-    [[ "$VPN_INTERFACES" =~ tailscale ]] || return 0
+remove_tailscale_policy_rules() {
+    local cidr
+    while read -r cidr; do
+        [[ -z "$cidr" ]] && continue
+        while ip rule del to "$cidr" lookup $TAILSCALE_ROUTE_TABLE 2>/dev/null; do :; done
+    done < <(ip rule show 2>/dev/null \
+        | awk '$4 == "to" && $6 == "lookup" && $7 == "52" {print $5}')
+}
 
+# Routing alone is not enough: Mullvad's `inet mullvad` output chain ends in
+# a bare `reject` and only accepts conntrack entries carrying its split-tunnel
+# ct mark. Host traffic to the tailnet leaves via tailscale0 and gets an
+# instant RST ("connection refused" in 0 ms).
+#
+# Match on the egress interface rather than a snapshot of table 52: route
+# discovery races tailscaled restarts, oifname does not. Only private/CGNAT
+# destinations are tagged, so exit-node traffic to the public internet still
+# hits Mullvad's reject (fail closed). Same idiom as lib/tailscale-web: filter
+# hook after conntrack, ct mark only, routing left to Tailscale's rules.
+remove_tailscale_nft() {
+    command -v nft >/dev/null 2>&1 || return 0
+    nft delete table inet "$TAILSCALE_NFT_TABLE" 2>/dev/null || true
+}
+
+apply_tailscale_nft() {
+    command -v nft >/dev/null 2>&1 || { warn "nft not found — Mullvad will reject tailnet traffic"; return 0; }
+    remove_tailscale_nft
+    nft -f - <<NFT
+table inet $TAILSCALE_NFT_TABLE {
+    chain output {
+        type filter hook output priority -10; policy accept;
+        oifname "tailscale0" ip daddr { 100.64.0.0/10, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } ct mark set $MULLVAD_CT_MARK comment "tailnet over tailscale0 past Mullvad"
+    }
+}
+NFT
+    info "Tailnet traffic on tailscale0 marked as Mullvad-excluded (nft table inet $TAILSCALE_NFT_TABLE)"
+}
+
+# tailscaled's own egress (control plane, DERP, WireGuard UDP) must bypass
+# Mullvad too, or it is rejected the same way and never logs in. Mullvad
+# excludes by PID, so the exclusion dies with every tailscaled restart.
+# The drop-in re-adds it on each start; the routes unit (ordered after
+# mullvad-daemon) re-checks it as a safety net for boot-order races. On the
+# physical IF, tailscaled is still confined to the tailscale ipset by UFW.
+exclude_tailscaled_from_mullvad() {
+    command -v mullvad >/dev/null 2>&1 || return 0
+    local pid
+    pid=$(systemctl show -p MainPID --value tailscaled 2>/dev/null || true)
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+    if mullvad split-tunnel list 2>/dev/null | grep -qx "$pid"; then
+        return 0
+    fi
+    if mullvad split-tunnel add "$pid" >/dev/null 2>&1; then
+        info "tailscaled (pid $pid) excluded from Mullvad"
+    else
+        warn "Could not exclude tailscaled (pid $pid) from Mullvad — Tailscale login will fail"
+    fi
+}
+
+install_tailscaled_dropin() {
+    command -v mullvad >/dev/null 2>&1 || return 0
+    mkdir -p "$(dirname "$TAILSCALED_DROPIN")"
+    cat > "$TAILSCALED_DROPIN" <<'DROPIN'
+# Managed by vpn-firewall-setup.sh — re-exclude tailscaled from Mullvad on
+# every start (Mullvad split-tunnel is PID-based). '-' keeps tailscaled up
+# if mullvad-daemon is absent or not ready yet.
+[Unit]
+After=mullvad-daemon.service
+
+[Service]
+ExecStartPost=-/usr/bin/mullvad split-tunnel add $MAINPID
+DROPIN
+    systemctl daemon-reload
+    info "tailscaled drop-in installed: $TAILSCALED_DROPIN"
+}
+
+remove_tailscaled_dropin() {
+    [[ -f "$TAILSCALED_DROPIN" ]] || return 0
+    rm -f "$TAILSCALED_DROPIN"
+    rmdir --ignore-fail-on-non-empty "$(dirname "$TAILSCALED_DROPIN")" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+apply_tailscale_route_rules() {
     local cidrs cidr
     cidrs=$(discover_tailscale_cidrs | xargs)
     [[ -z "$cidrs" ]] && return 0
 
     detect_tailscale_rule_prio
-
-    # Flush any stale rules left from previous installs at other priorities,
-    # so we don't accumulate duplicates whenever Mullvad's priority shifts.
-    for cidr in $cidrs; do
-        while ip rule del to "$cidr" lookup $TAILSCALE_ROUTE_TABLE 2>/dev/null; do :; done
-    done
+    remove_tailscale_policy_rules
 
     info "Installing Tailscale routing rules (priority $TAILSCALE_RULE_PRIO → table $TAILSCALE_ROUTE_TABLE):"
     for cidr in $cidrs; do
         ip rule add to "$cidr" lookup $TAILSCALE_ROUTE_TABLE priority $TAILSCALE_RULE_PRIO
         info "  $cidr"
     done
+    apply_tailscale_nft
+    exclude_tailscaled_from_mullvad
+    if [[ -f "$TAILSCALE_WEB_ENABLED" ]]; then
+        # Missing peer/route fails closed for OpenClaw without breaking other routes.
+        tailscale_web_helper apply || warn "OpenClaw client check failed; inspect output and rerun tailscale-routes apply when Tailscale is ready."
+    fi
+}
 
-    # Persist via systemd oneshot. Re-applies at boot independent of UFW order.
-    # The CIDR list AND priority are baked in at install time — re-run the
-    # script (providers / auto / setup) to re-discover after adding tailnet
-    # subnet routers OR after a Mullvad app update changes its rule priority.
-    local exec_lines=""
-    for cidr in $cidrs; do
-        exec_lines+="ExecStart=-/sbin/ip rule del to $cidr lookup $TAILSCALE_ROUTE_TABLE priority $TAILSCALE_RULE_PRIO"$'\n'
-        exec_lines+="ExecStart=/sbin/ip rule add to $cidr lookup $TAILSCALE_ROUTE_TABLE priority $TAILSCALE_RULE_PRIO"$'\n'
-    done
+install_tailscale_route_rules() {
+    # Skip if tailscale isn't part of this killswitch profile.
+    [[ "$VPN_INTERFACES" =~ tailscale ]] || return 0
+
+    # This workstation's OpenClaw profile is enabled with the user's normal
+    # combined provider selection; preserve general DNS and browser VPN policy.
+    if [[ -f "$PROVIDERS_ACTIVE_FILE" ]] && grep -qw mullvad "$PROVIDERS_ACTIVE_FILE" && grep -qw tailscale "$PROVIDERS_ACTIVE_FILE"; then
+        mkdir -p "$(dirname "$TAILSCALE_WEB_ENABLED")"
+        touch "$TAILSCALE_WEB_ENABLED"
+    elif [[ -f "$TAILSCALE_WEB_ENABLED" ]]; then
+        remove_tailscale_web
+    fi
+    install_tailscaled_dropin
+    local script
+    script=$(readlink -f "$0")
 
     cat > "$TAILSCALE_ROUTES_UNIT" <<UNIT
 [Unit]
-Description=VPN Kill-Switch — Tailscale subnet route rules (priority $TAILSCALE_RULE_PRIO)
-After=network-pre.target
-Before=network.target
+Description=VPN Kill-Switch — dynamic Tailscale subnet route rules
+After=network-online.target tailscaled.service mullvad-daemon.service
+Wants=network-online.target tailscaled.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-${exec_lines}ExecStop=/bin/sh -c 'while /sbin/ip rule del priority $TAILSCALE_RULE_PRIO 2>/dev/null; do :; done'
+ExecStart=$script tailscale-routes _apply
 
 [Install]
 WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
     systemctl enable vpn-killswitch-tailscale-routes.service >/dev/null 2>&1 || true
+    systemctl restart vpn-killswitch-tailscale-routes.service
     info "Boot-persisted via $TAILSCALE_ROUTES_UNIT"
 }
 
 remove_tailscale_route_rules() {
-    # Capture priority from the installed unit before deleting it, so we can
-    # flush the matching rules. Falls back to a sweep across all priorities
-    # we have ever used if the unit is gone or unparseable.
-    local prio=""
+    remove_tailscale_web
     if [[ -f "$TAILSCALE_ROUTES_UNIT" ]]; then
-        prio=$(awk '/^ExecStop=.*ip rule del priority/ {
-            for (i=1;i<=NF;i++) if ($i=="priority") { print $(i+1); exit }
-        }' "$TAILSCALE_ROUTES_UNIT")
         systemctl disable --now vpn-killswitch-tailscale-routes.service 2>/dev/null || true
         rm -f "$TAILSCALE_ROUTES_UNIT"
         systemctl daemon-reload 2>/dev/null || true
     fi
-    if [[ -n "$prio" ]]; then
-        while ip rule del priority "$prio" 2>/dev/null; do :; done
-    else
-        # Sweep historical priorities (5100, 5200) in case the unit was already gone.
-        for p in 5100 5200; do
-            while ip rule del priority "$p" 2>/dev/null; do :; done
-        done
-    fi
+    remove_tailscale_policy_rules
+    remove_tailscale_nft
+    remove_tailscaled_dropin
 }
 
 # ---------- Per-domain split tunneling ----------
@@ -1456,6 +1689,374 @@ split_connect() {
         --down "$(split_down_script "$SPLIT_NAME")"
 }
 
+# ---------- cgroup-based VPN exclusion ----------
+#
+# "split by destination" (above) routes chosen DOMAINS through an auxiliary
+# tunnel. This section runs an arbitrary COMMAND whose traffic BYPASSES the VPN
+# entirely and egresses the physical IF — the classic `mullvad-exclude`, but
+# VPN-agnostic and, crucially, punched through THIS killswitch (mullvad-exclude
+# alone is still DROP'd by our `-o $PHYS -j DROP` rule).
+#
+# Keyed on a dedicated cgroup v2 (EXCLUDE_CGROUP), NOT a user — so a *root*
+# command (apt, package managers) can be excluded just as easily as an
+# unprivileged one. `exclude run` drops the launched process into the cgroup;
+# everything it spawns inherits membership.
+#
+# Three coupled pieces:
+#   1. Mark — mangle OUTPUT matches the cgroup (`-m cgroup --path`) and sets
+#      fwmark, but RETURNs first for loopback/LAN/link-local/multicast so the
+#      local resolver, LAN and VPN-DNS keep working (only real internet diverts).
+#   2. Route + SNAT — fwmark → table EXCLUDE_TABLE (default via the PHYSICAL
+#      gateway, overriding the VPN default because ip-rules precede the main
+#      table) and MASQUERADE to the physical IP (sockets bind the tunnel source
+#      at connect(), before our reroute — without SNAT the reply never returns).
+#   3. Firewall — because mangle OUTPUT (prio -150) runs before filter OUTPUT,
+#      excluded packets already carry the mark at the killswitch; a single
+#      mark-match ACCEPT in before.rules (before the DROP) covers them all.
+#
+# Routing is (re)applied at boot / IF-change by a systemd unit; the before.rules
+# ACCEPT persists because add_killswitch_before_rules() re-emits it on every
+# setup and exclude_sync_before_rules() live-patches it in between.
+EXCLUDE_USERS_FILE="/etc/vpn-killswitch/exclude.users"   # legacy (uid mode); removed on enable
+EXCLUDE_MARK="0x51"
+EXCLUDE_TABLE=151
+EXCLUDE_PRIO=5080          # < Mullvad fwmark rule (~5199) and < main table (32766)
+EXCLUDE_MANGLE_CHAIN="VPNKIS-EXCLUDE"
+EXCLUDE_NAT_CHAIN="VPNKIS-EXCLUDE-NAT"
+EXCLUDE_UNIT=/etc/systemd/system/vpn-killswitch-exclude.service
+EXCLUDE_CGROUP="/sys/fs/cgroup/vpnkis-exclude"           # cgroup v2 dir (we own it)
+EXCLUDE_CGROUP_REL="vpnkis-exclude"                       # same, relative — for -m cgroup --path
+EXCLUDE_BEGIN="# --- BEGIN vpn-kis exclude (mark ${EXCLUDE_MARK} via cgroup ${EXCLUDE_CGROUP_REL}) ---"
+EXCLUDE_END="# --- END vpn-kis exclude ---"
+# Stable prefixes so exclude_sync_before_rules strips blocks written by older
+# versions (e.g. the owner-based one) regardless of the descriptive suffix.
+EXCLUDE_BEGIN_PREFIX="# --- BEGIN vpn-kis exclude"
+EXCLUDE_END_PREFIX="# --- END vpn-kis exclude"
+
+# The physical IF the killswitch guards — read authoritatively from the DROP
+# rule (same source the NM dispatcher uses, so we auto-follow its rewrites).
+exclude_phys() {
+    local p
+    p=$(grep -oP '(?<=-o )[A-Za-z0-9_.-]+(?= -j DROP)' /etc/ufw/before.rules 2>/dev/null | head -1)
+    if [[ -z "$p" ]]; then detect_physical_if >/dev/null 2>&1 || true; p="$PHYSICAL_IF"; fi
+    echo "$p"
+}
+
+# Exclusion is "enabled" once the systemd unit exists (persistent marker).
+exclude_enabled() { [[ -f "$EXCLUDE_UNIT" ]]; }
+
+# Create the cgroup v2 directory we drop excluded processes into. It must exist
+# before the `-m cgroup --path` rule is added (the match resolves the path at
+# insertion time). We own it — systemd doesn't manage it.
+exclude_ensure_cgroup() {
+    [[ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" == "cgroup2fs" ]] \
+        || { warn "exclude: /sys/fs/cgroup is not cgroup v2 — cgroup exclusion unavailable"; return 1; }
+    [[ -d "$EXCLUDE_CGROUP" ]] || mkdir "$EXCLUDE_CGROUP" 2>/dev/null \
+        || { warn "exclude: cannot create cgroup $EXCLUDE_CGROUP"; return 1; }
+}
+
+# Print the before.rules ACCEPT block (marker-wrapped). Single mark-match rule,
+# emitted only while exclusion is enabled. Empty otherwise.
+exclude_emit_before_rules_block() {
+    local phys="${1:-$PHYSICAL_IF}"
+    exclude_enabled || return 0
+    echo ""
+    echo "$EXCLUDE_BEGIN"
+    echo "-A ufw-before-output -o $phys -m mark --mark $EXCLUDE_MARK -j ACCEPT"
+    echo "$EXCLUDE_END"
+}
+
+# Live-patch /etc/ufw/before.rules: strip any prior exclude block (matched by
+# stable marker prefix, so old owner-based blocks are cleaned too), re-insert
+# the current one immediately before the physical-IF DROP, then reload.
+exclude_sync_before_rules() {
+    local rules=/etc/ufw/before.rules phys tmp block
+    [[ -f "$rules" ]] || error "no $rules — install the killswitch first (sudo $0 setup ...)"
+    phys=$(exclude_phys)
+    block=$(exclude_emit_before_rules_block "$phys")
+    tmp=$(mktemp)
+    awk -v beginp="$EXCLUDE_BEGIN_PREFIX" -v endp="$EXCLUDE_END_PREFIX" \
+        -v phys="$phys" -v block="$block" '
+        index($0, beginp) == 1 { inblk=1; next }
+        inblk && index($0, endp) == 1 { inblk=0; next }
+        inblk { next }
+        $0 ~ ("^-A ufw-before-output -o " phys " -j DROP") && block != "" { print block }
+        { print }
+    ' "$rules" > "$tmp" && cat "$tmp" > "$rules"
+    rm -f "$tmp"
+    ufw reload >/dev/null 2>&1 || warn "ufw reload failed — check 'ufw status'"
+}
+
+# Apply mark + policy routing + SNAT for the excluded cgroup. Idempotent (flushes
+# then rebuilds). Also invoked by the systemd unit (ExecStart) at boot/IF-change.
+exclude_apply_routing() {
+    local phys gw
+    if ! exclude_enabled; then
+        exclude_teardown_routing
+        return 0
+    fi
+    exclude_ensure_cgroup || return 1
+    phys=$(exclude_phys)
+    gw=$(ip route show dev "$phys" 2>/dev/null | awk '/^default via/{print $3; exit}')
+    [[ -n "$gw" ]] || gw=$(ip route show dev "$phys" 2>/dev/null | awk '/ via /{print $3; exit}')
+    [[ -n "$gw" ]] || { warn "exclude: cannot determine physical gateway on $phys — routing not applied"; return 1; }
+
+    # mangle: mark the excluded cgroup's outbound packets
+    iptables -t mangle -N "$EXCLUDE_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -C OUTPUT -j "$EXCLUDE_MANGLE_CHAIN" 2>/dev/null \
+        || iptables -t mangle -A OUTPUT -j "$EXCLUDE_MANGLE_CHAIN"
+    iptables -t mangle -F "$EXCLUDE_MANGLE_CHAIN"
+
+    # Only divert REAL internet traffic. Loopback, LAN, link-local and multicast
+    # destinations must keep using the main table — otherwise table
+    # $EXCLUDE_TABLE (which holds only a default route) would force e.g. DNS to
+    # the local resolver (127.0.0.53), LAN hosts, or a VPN DNS (10.x) out the
+    # physical gateway, where the kernel drops them as martians (breaks name
+    # resolution — only literal IPs would work).
+    local skipnet
+    for skipnet in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 \
+                   169.254.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+        iptables -t mangle -A "$EXCLUDE_MANGLE_CHAIN" -d "$skipnet" -j RETURN
+    done
+    iptables -t mangle -A "$EXCLUDE_MANGLE_CHAIN" \
+        -m cgroup --path "$EXCLUDE_CGROUP_REL" -j MARK --set-mark "$EXCLUDE_MARK" \
+        || warn "exclude: cgroup mark rule failed (xt_cgroup missing, or cgroup absent)"
+
+    # policy routing: marked traffic uses a table whose default is the physical gw
+    ip route replace default via "$gw" dev "$phys" table "$EXCLUDE_TABLE"
+    while ip rule del priority "$EXCLUDE_PRIO" 2>/dev/null; do :; done
+    ip rule add fwmark "$EXCLUDE_MARK" lookup "$EXCLUDE_TABLE" priority "$EXCLUDE_PRIO"
+
+    # nat: source-NAT marked traffic to the physical IP (see header note 2).
+    iptables -t nat -N "$EXCLUDE_NAT_CHAIN" 2>/dev/null || true
+    iptables -t nat -C POSTROUTING -j "$EXCLUDE_NAT_CHAIN" 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -j "$EXCLUDE_NAT_CHAIN"
+    iptables -t nat -F "$EXCLUDE_NAT_CHAIN"
+    iptables -t nat -A "$EXCLUDE_NAT_CHAIN" -m mark --mark "$EXCLUDE_MARK" -o "$phys" -j MASQUERADE
+
+    info "exclude: active (cgroup $EXCLUDE_CGROUP_REL → $phys via $gw, mark $EXCLUDE_MARK table $EXCLUDE_TABLE, SNAT→$phys)"
+}
+
+exclude_teardown_routing() {
+    while ip rule del priority "$EXCLUDE_PRIO" 2>/dev/null; do :; done
+    ip route flush table "$EXCLUDE_TABLE" 2>/dev/null || true
+    iptables -t mangle -F "$EXCLUDE_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -j "$EXCLUDE_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$EXCLUDE_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$EXCLUDE_NAT_CHAIN" 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -j "$EXCLUDE_NAT_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$EXCLUDE_NAT_CHAIN" 2>/dev/null || true
+}
+
+exclude_install_unit() {
+    local script
+    script=$(readlink -f "$0")
+    cat > "$EXCLUDE_UNIT" <<UNIT
+[Unit]
+Description=VPN Kill-Switch — cgroup-based VPN exclusion (mark + route excluded cgroup)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$script exclude _apply
+ExecStop=$script exclude _teardown
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable vpn-killswitch-exclude.service >/dev/null 2>&1 || true
+}
+
+exclude_remove_unit() {
+    systemctl disable --now vpn-killswitch-exclude.service 2>/dev/null || true
+    rm -f "$EXCLUDE_UNIT"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# Full teardown for unlock/panic: routing, unit, cgroup, legacy state.
+exclude_remove_all() {
+    rm -f "$EXCLUDE_USERS_FILE"
+    exclude_teardown_routing
+    exclude_remove_unit
+    rmdir "$EXCLUDE_CGROUP" 2>/dev/null || true
+}
+
+# Enable persistent exclusion: unit + routing + before.rules. Idempotent.
+exclude_enable() {
+    require_root
+    rm -f "$EXCLUDE_USERS_FILE" 2>/dev/null || true   # drop legacy uid-mode state
+    exclude_install_unit
+    exclude_ensure_cgroup || error "exclude: cgroup v2 unavailable — cannot enable"
+    exclude_apply_routing
+    exclude_sync_before_rules
+}
+
+exclude_disable() {
+    require_root
+    exclude_remove_unit          # clears the 'enabled' marker so sync emits nothing
+    exclude_teardown_routing
+    rmdir "$EXCLUDE_CGROUP" 2>/dev/null || true
+    exclude_sync_before_rules
+    info "exclude: disabled — routing, unit, cgroup and before.rules ACCEPT removed."
+}
+
+exclude_status() {
+    if ! exclude_enabled; then
+        info "exclude: disabled. Enable + run in one step: sudo $0 exclude run -- <command>"
+        return 0
+    fi
+    local phys
+    phys=$(exclude_phys)
+    info "exclude: ENABLED (cgroup $EXCLUDE_CGROUP → $phys, mark $EXCLUDE_MARK table $EXCLUDE_TABLE)"
+    info "  members (PIDs in cgroup):"; sed 's/^/    /' "$EXCLUDE_CGROUP/cgroup.procs" 2>/dev/null || echo "    (none / cgroup absent)"
+    echo ""
+    info "ip rule (prio $EXCLUDE_PRIO):"; ip rule show priority "$EXCLUDE_PRIO" 2>/dev/null | sed 's/^/  /'
+    info "route table $EXCLUDE_TABLE:";   ip route show table "$EXCLUDE_TABLE" 2>/dev/null | sed 's/^/  /'
+    info "mangle chain:";                 iptables -t mangle -S "$EXCLUDE_MANGLE_CHAIN" 2>/dev/null | sed 's/^/  /' || true
+    info "nat chain:";                    iptables -t nat -S "$EXCLUDE_NAT_CHAIN" 2>/dev/null | sed 's/^/  /' || true
+    info "before.rules ACCEPT:";          grep -- "--mark $EXCLUDE_MARK" /etc/ufw/before.rules 2>/dev/null | sed 's/^/  /' || true
+    info "unit:"; systemctl is-active vpn-killswitch-exclude.service 2>&1 | sed 's/^/  active : /'
+}
+
+# Run a command with its traffic excluded from the VPN.
+#   exclude run [--as USER] -- <command...>
+# Default runs as root (so root commands like apt work). --as drops privileges
+# AFTER joining the cgroup (membership is inherited regardless of uid).
+exclude_run() {
+    require_root
+    local as=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)   as="${2:-}"; [[ -n "$as" ]] || error "exclude run: --as needs a username"; shift 2 ;;
+            --as=*) as="${1#*=}"; shift ;;
+            --)     shift; break ;;
+            --*)    error "exclude run: unknown flag '$1'" ;;
+            *)      break ;;
+        esac
+    done
+    # Back-compat with the old `run USER -- cmd` form → treat USER as --as.
+    if [[ -z "$as" && $# -ge 2 && "${2:-}" == "--" ]] && id "$1" >/dev/null 2>&1; then
+        as="$1"; shift 2
+    fi
+    [[ $# -ge 1 ]] || error "exclude run: usage: sudo $0 exclude run [--as USER] -- <command>"
+    if [[ -n "$as" ]]; then
+        id "$as" >/dev/null 2>&1 || error "exclude run: user '$as' does not exist"
+        command -v runuser >/dev/null 2>&1 || error "exclude run: 'runuser' (util-linux) needed for --as"
+    fi
+
+    exclude_enabled || { info "exclude: enabling on first use…"; exclude_enable; }
+    # Re-assert rules so a fresh/valid cgroup ref is in the mark rule (the cgroup
+    # can be GC'd while empty; re-apply guarantees the running command is caught).
+    exclude_apply_routing || error "exclude run: could not apply exclusion rules"
+    # Self-heal: ensure the killswitch actually permits marked traffic. Missing
+    # when migrating from an older (owner-based) install, or if before.rules was
+    # regenerated without the ACCEPT. Sync once (reloads ufw) only when absent.
+    grep -q -- "--mark $EXCLUDE_MARK -j ACCEPT" /etc/ufw/before.rules 2>/dev/null \
+        || exclude_sync_before_rules
+
+    # Join the cgroup (as root), then exec — optionally dropping to --as USER.
+    if [[ -n "$as" ]]; then
+        exec sh -c 'echo $$ > "$1/cgroup.procs" || { echo "exclude: cannot join cgroup $1" >&2; exit 1; }; \
+                    u=$2; shift 2; exec runuser -u "$u" -- "$@"' \
+            sh "$EXCLUDE_CGROUP" "$as" "$@"
+    else
+        exec sh -c 'echo $$ > "$1/cgroup.procs" || { echo "exclude: cannot join cgroup $1" >&2; exit 1; }; \
+                    shift; exec "$@"' \
+            sh "$EXCLUDE_CGROUP" "$@"
+    fi
+}
+
+# ---------- Endpoint auto-refresh ----------
+#
+# Re-fetch provider IPs and atomically rebuild the vpn_endpoints ipset
+# WITHOUT touching UFW rules. Safe to run from a timer while connected:
+# the new set is built aside and swapped in one kernel op, so there is no
+# window where the killswitch has an empty whitelist. This is what keeps
+# dynamic-IP providers (DDNS `remote` hosts) working in strict mode.
+refresh_endpoints() {
+    local names=("$@")
+    if [[ ${#names[@]} -eq 0 ]]; then
+        [[ -f "$PROVIDERS_ACTIVE_FILE" ]] \
+            || error "refresh: no providers given and $PROVIDERS_ACTIVE_FILE missing. Run '$0 refresh <names>' once to seed it."
+        read -ra names < "$PROVIDERS_ACTIVE_FILE"
+    else
+        # Explicit list becomes the new active set — the timer picks it up.
+        mkdir -p "$(dirname "$PROVIDERS_ACTIVE_FILE")"
+        echo "${names[*]}" > "$PROVIDERS_ACTIVE_FILE"
+    fi
+    [[ ${#names[@]} -gt 0 ]] || error "refresh: empty provider list"
+
+    local p
+    for p in "${names[@]}"; do
+        fetch_provider "$p" || warn "refresh: fetch failed for $p — keeping cached list"
+    done
+
+    local ips
+    ips="$(load_providers "${names[@]}") $DNS_BOOTSTRAP_IPS"
+    [[ -n "${ips// }" ]] || error "refresh: no IPs to load — aborting (current ipset left untouched)"
+
+    ipset create vpn_endpoints hash:ip family inet hashsize 2048 maxelem 65536 -exist
+    ipset create vpn_endpoints_new hash:ip family inet hashsize 2048 maxelem 65536 -exist
+    ipset flush vpn_endpoints_new
+    {
+        for p in $ips; do echo "add vpn_endpoints_new $p"; done
+    } | ipset restore -exist
+    ipset swap vpn_endpoints_new vpn_endpoints
+    ipset destroy vpn_endpoints_new
+    ipset save vpn_endpoints > /etc/ipset.conf
+
+    local count
+    count=$(ipset list vpn_endpoints 2>/dev/null | awk '/Number of entries:/ {print $NF}')
+    info "refresh: vpn_endpoints now has $count IPs (providers: ${names[*]})"
+}
+
+install_refresh_timer() {
+    local interval="${1:-15min}"
+    local script
+    script=$(readlink -f "$0")
+    [[ -f "$PROVIDERS_ACTIVE_FILE" ]] \
+        || warn "No $PROVIDERS_ACTIVE_FILE yet — timer will fail until you run '$0 providers <names>' once."
+
+    cat > "$REFRESH_SERVICE" <<UNIT
+[Unit]
+Description=VPN Kill-Switch — refresh endpoint ipset from provider lists
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$script refresh
+UNIT
+
+    cat > "$REFRESH_TIMER" <<UNIT
+[Unit]
+Description=VPN Kill-Switch — periodic endpoint refresh
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=$interval
+RandomizedDelaySec=30
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable --now vpn-killswitch-refresh.timer
+    info "Refresh timer active: every $interval (vpn-killswitch-refresh.timer)"
+    info "Provider list read from $PROVIDERS_ACTIVE_FILE (set by 'providers <names>')."
+}
+
+remove_refresh_timer() {
+    systemctl disable --now vpn-killswitch-refresh.timer 2>/dev/null || true
+    rm -f "$REFRESH_TIMER" "$REFRESH_SERVICE"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 install_nm_dispatcher() {
     # Re-apply firewall when physical IF changes (wifi↔ethernet, dock, etc.)
     if [[ ! -d /etc/NetworkManager/dispatcher.d ]]; then
@@ -1480,6 +2081,12 @@ BAK="$RULES.nm-bak"
 
 log() { logger -t "$LOG_TAG" -- "$*"; }
 
+refresh_tailscale_routes() {
+    systemctl is-enabled --quiet vpn-killswitch-tailscale-routes.service 2>/dev/null || return 0
+    systemctl restart vpn-killswitch-tailscale-routes.service 2>/dev/null \
+        || log "failed to refresh Tailscale policy routes"
+}
+
 # Pattern of ifaces we must NEVER pin the killswitch DROP rule onto.
 is_virtual() {
     case "$1" in
@@ -1490,13 +2097,16 @@ is_virtual() {
 
 # Only react to relevant NM events
 case "$ACTION" in
-    up|down|connectivity-change) ;;
+    up|down|vpn-up|vpn-down|connectivity-change) ;;
     *) exit 0 ;;
 esac
 
 # Ignore the hook when triggered BY a VPN/virtual iface coming up — those
 # events fire NEW_IF detection at the wrong moment (tunnel = default route).
 if [ -n "$IFACE" ] && is_virtual "$IFACE"; then
+    case "$IFACE" in
+        wg*|tailscale*) refresh_tailscale_routes ;;
+    esac
     exit 0
 fi
 
@@ -1543,7 +2153,7 @@ if is_virtual "$NEW_IF"; then
     exit 0
 fi
 
-[ "$NEW_IF" = "$CURRENT" ] && exit 0
+[ "$NEW_IF" = "$CURRENT" ] && { refresh_tailscale_routes; exit 0; }
 
 log "physical IF changed: $CURRENT -> $NEW_IF, reapplying"
 
@@ -1571,6 +2181,13 @@ if ! ufw reload >/dev/null 2>&1; then
 fi
 
 log "killswitch retargeted: $CURRENT -> $NEW_IF"
+
+# Re-apply owner-based VPN-exclude routing for the new physical IF (its route
+# table + gateway are IF-specific; the before.rules ACCEPTs were already
+# sed-rewritten above alongside the DROP rule).
+systemctl restart vpn-killswitch-exclude.service 2>/dev/null || true
+refresh_tailscale_routes
+
 exit 0
 HOOK
     chmod 755 /etc/NetworkManager/dispatcher.d/90-vpn-killswitch
@@ -1587,16 +2204,28 @@ verify() {
 
     echo ""
     info "iptables OUTPUT chain:"
-    iptables -L OUTPUT -n -v | head -20
+    show_filter_chain OUTPUT
 
     echo ""
     info "Physical IF kill-switch (should see DROP at end):"
-    iptables -L ufw-before-output -n | grep -E 'DROP|ACCEPT' | tail -5
+    local kill_rules
+    kill_rules=$(ipt_ro -S ufw-before-output | grep -E 'DROP|ACCEPT' | tail -5 || true)
+    if [[ -n "$kill_rules" ]]; then
+        printf '%s\n' "$kill_rules"
+    else
+        warn "ufw-before-output unreadable or empty — KILL-SWITCH NOT CONFIRMED."
+        warn "Inspect with: nft list chain ip filter ufw-before-output"
+    fi
 
     echo ""
     info "IPv6 status:"
-    val=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "0")
-    [[ "$val" == "1" ]] && info "IPv6: DISABLED (good)" || warn "IPv6: still enabled — reboot required"
+    if [[ ! -e /proc/sys/net/ipv6 ]]; then
+        info "IPv6: ABSENT — stack not loaded (best)"
+    elif [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" == "1" ]]; then
+        info "IPv6: DISABLED (good)"
+    else
+        warn "IPv6: still enabled — reboot required"
+    fi
 
     echo ""
     info "Active interfaces:"
@@ -1624,6 +2253,17 @@ Usage:
   $0 providers <name> [name ...]   Strict-lock to union of provider profiles
                                    (e.g. '$0 providers mullvad airvpn')
   $0 fetch [name ...]              Refresh provider IP lists (default: all known)
+  $0 refresh [name ...]            Re-fetch providers + atomically rebuild the
+                                   vpn_endpoints ipset (no UFW reload, no leak
+                                   window). Default: providers from last
+                                   'providers' run. Use after a server IP
+                                   rotates and OpenVPN logs EPERM writes.
+  $0 refresh install [interval]    Systemd timer running 'refresh' periodically
+                                   (default: 15min). Keeps dynamic-IP/DDNS
+                                   endpoints unblocked automatically.
+  $0 refresh uninstall             Remove the refresh timer
+  $0 tailscale-web [apply|remove]  OpenClaw HTTPS-only Mullvad exception + local hostname
+                                   Runtime firewall rule; preserves general DNS/VPN policy.
   $0 detect                        Print detected VPN endpoints, exit
   $0 test [passive|active]         Run killswitch self-tests (default: passive)
                                    passive = non-disruptive rule checks
@@ -1637,6 +2277,19 @@ Usage:
   $0 split connect <name>          Launch openvpn with split-tunnel flags
                                    (route-nopull, --dev pin, up/down hooks,
                                    wraps with mullvad-exclude if Mullvad up)
+  $0 exclude run [--as U] -- <cmd> Run <cmd> with its traffic BYPASSING the VPN
+                                   (out the physical IF, punched through the
+                                   killswitch). Runs as root by default so root
+                                   commands work; --as U drops to user U.
+                                   Auto-enables on first use. Keyed on a cgroup,
+                                   so root commands (apt, etc.) work too.
+                                   e.g. sudo $0 exclude run -- apt-get update
+                                        sudo $0 exclude run --as $USER -- curl ifconfig.me
+  $0 exclude on                    Enable exclusion infra explicitly (unit +
+                                   routing + before.rules ACCEPT). Persists
+                                   across reboot + ufw reload.
+  $0 exclude off                   Disable + tear everything down
+  $0 exclude status                Show state (cgroup members, routing, fw)
   $0 unlock                        Restore UFW from latest backup
   $0 panic                         EMERGENCY: drop all firewall rules, reset
                                    DNS, re-enable IPv6, restart network stack.
@@ -1661,7 +2314,9 @@ Providers:
   airvpn    — scanned from /etc/openvpn + Eddie config dirs
   tailscale — DERP relays + control plane (login.tailscale.com derpmap)
               Strict mode forces peer traffic via DERP relay (no direct UDP).
-  <custom>  — drop IPs (one per line) into $PROVIDERS_DIR/<name>.ips
+  <custom>  — drop IPs (one per line) into $PROVIDERS_DIR/<name>.ips, OR
+              create $SPLIT_CONF_DIR/<name>.conf with OVPN_CONFIG= — fetch
+              then resolves the .ovpn 'remote' hosts (DDNS-friendly).
 
 Modes:
   PERMISSIVE  Default. DNS + 443 + VPN ports open to any host on physical IF.
@@ -1680,6 +2335,11 @@ Example workflows:
 
   # Cluster-LAN management exception (Talos apid :50000, kubelet, etc.):
   sudo $0 --lan 192.168.100.0/24 providers mullvad tailscale airvpn
+
+  # Custom dynamic-IP provider (corporate OpenVPN behind DDNS) that never
+  # goes stale: lock once, then auto-refresh every 15 min:
+  sudo $0 providers mullvad airvpn tailscale funeraria
+  sudo $0 refresh install 15min
 
   # Rollback:
   sudo $0 unlock
@@ -1711,9 +2371,41 @@ main() {
             require_root
             unlock_firewall
             exit 0 ;;
+        refresh)
+            require_root
+            local sub="${1:-}"
+            case "$sub" in
+                install|timer)
+                    shift || true
+                    install_refresh_timer "${1:-}" ;;
+                uninstall|remove)
+                    remove_refresh_timer
+                    info "Refresh timer removed." ;;
+                *)
+                    refresh_endpoints "$@" ;;
+            esac
+            exit 0 ;;
         panic|rescue|emergency)
             require_root
             panic_recover
+            exit 0 ;;
+        tailscale-web)
+            require_root
+            if [[ "${1:-apply}" == "remove" ]]; then
+                remove_tailscale_web
+            else
+                tailscale_web_helper "${1:-apply}"
+            fi
+            exit 0 ;;
+        tailscale-routes)
+            require_root
+            local sub="${1:-_apply}"
+            case "$sub" in
+                _apply|apply) apply_tailscale_route_rules ;;
+                install)      install_tailscale_route_rules; install_nm_dispatcher ;;
+                remove|rm)    remove_tailscale_route_rules ;;
+                *) error "tailscale-routes: unknown subcommand '$sub'. Try: apply|install|remove" ;;
+            esac
             exit 0 ;;
         split)
             local sub="${1:-list}"
@@ -1735,6 +2427,20 @@ main() {
                     split_connect "$1" ;;
                 *)
                     error "split: unknown subcommand '$sub'. Try: add|rm|list|status|connect" ;;
+            esac
+            exit 0 ;;
+        exclude)
+            local sub="${1:-status}"
+            shift || true
+            case "$sub" in
+                run|exec)              exclude_run "$@" ;;
+                on|enable|add|install) exclude_enable
+                                       info "exclude: enabled. Run: sudo $0 exclude run -- <command>  (add --as USER to drop root)" ;;
+                off|disable|rm|remove|del|delete) exclude_disable ;;
+                status|ls|list|show)   exclude_status ;;
+                _apply)                require_root; exclude_apply_routing ;;
+                _teardown)             require_root; exclude_teardown_routing ;;
+                *) error "exclude: unknown subcommand '$sub'. Try: run|on|off|status" ;;
             esac
             exit 0 ;;
         test)
@@ -1769,6 +2475,8 @@ main() {
             local count
             count=$(echo "$VPN_ENDPOINTS" | wc -w)
             info "Locking to $count endpoints from: $*"
+            mkdir -p "$(dirname "$PROVIDERS_ACTIVE_FILE")"
+            echo "$*" > "$PROVIDERS_ACTIVE_FILE"
             ;;
         auto)
             require_root
