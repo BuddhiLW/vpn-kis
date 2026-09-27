@@ -4,6 +4,12 @@ A strict VPN kill-switch for Linux that supports **Mullvad**, **AirVPN/Eddie**, 
 
 If your VPN tunnel drops, packets stop. No DNS leak, no fallback to clearnet, no opportunistic IPv6 escape. Reconnect, or run `sudo ./vpn-firewall-setup.sh unlock` to roll back.
 
+## Implementation (v5)
+
+`vpn-firewall-setup.sh` is now a small shim. The kill-switch itself is [vpn-kis-bb](https://github.com/BuddhiLW/vpn-kis-bb), a Clojure implementation run by [ClojureWasm](https://github.com/BuddhiLW/ClojureWasm) (`cljw`), with the same commands, aliases, flags and environment variables, byte-identical rules, and a test suite that runs without root. The shim finds it next to this repo (`../vpn-kis-bb`), through `VPN_KIS_BB_HOME`, or as `vpn-kis` on PATH.
+
+The previous bash implementation is kept as `lib/legacy/vpn-firewall-setup.bash`; `sudo VPN_KIS_LEGACY=1 ./vpn-firewall-setup.sh ...` runs it instead. `tests/bash/run.sh` tests that legacy script.
+
 ## What you get
 
 - **Strict mode** locks egress on the physical interface to a union of provider endpoint IPs. Pre-tunnel traffic that isn't to a whitelisted relay/DERP/bridge is dropped.
@@ -12,19 +18,22 @@ If your VPN tunnel drops, packets stop. No DNS leak, no fallback to clearnet, no
   - `mullvad` — pulled from `api.mullvad.net` (WireGuard + OpenVPN + bridge relays).
   - `airvpn` — parsed from `.ovpn` and WireGuard `.conf` files in `/etc/openvpn` and Eddie config dirs.
   - `tailscale` — DERP relays from `derpmap/default` + hardcoded bootstrap DNS list + control plane hosts.
-- **Tailscale + Mullvad coexistence** without manual `mullvad-exclude` juggling. Installs `ip rule` entries at priority 5200 (above Mullvad's fwmark default at 5209) so traffic to Tailscale CGNAT (`100.64.0.0/10`) and advertised RFC1918 subnets actually exits `tailscale0`. Persisted via a systemd oneshot.
+- **Tailscale + Mullvad coexistence** without manual `mullvad-exclude` juggling. Traffic to Tailscale CGNAT (`100.64.0.0/10`) and the RFC1918 subnets tailscale routes gets Mullvad's own fwmark and conntrack mark (nft table `inet vpn-killswitch-tailscale`), so Mullvad's rules let it out through `tailscale0` however Mullvad reorders its ip rules on reconnect. Mullvad's DNS (10.64.0.1) always stays in the tunnel. Persisted via a systemd oneshot and a NetworkManager hook.
 - **FORWARD chain rules** so containers, VMs, and netns traffic can egress through VPN interfaces. Without these, Docker containers' tunnel-bound traffic dies silently at `FORWARD` policy `DROP`.
 - **NetworkManager dispatcher hook** that retargets the kill-switch when the physical interface changes (wifi ↔ ethernet, dock, etc.) — with safety guards that refuse to retarget the DROP rule onto a VPN interface.
-- **Emergency `panic`** subcommand: drops all firewall rules, destroys ipsets, removes the dispatcher hook, re-enables IPv6 at runtime, resets `/etc/resolv.conf` to public resolvers, restarts `systemd-resolved` + `NetworkManager` + `tailscaled`, runs a connectivity probe. Use from a local TTY when you've locked yourself out.
+- **Emergency `panic`** subcommand: drops all firewall rules, destroys ipsets, removes the dispatcher hook, re-enables IPv6 at runtime, resets `/etc/resolv.conf` to public resolvers, restarts `systemd-resolved` + `NetworkManager` + `tailscaled`, runs a connectivity probe. It keeps the Tailscale bypass, so the tailnet (and a cluster behind it) stays reachable, and it never stops halfway: failed steps are listed at the end. Use from a local TTY when you've locked yourself out.
 - **`unlock`** for the non-destructive rollback path: restores UFW from the snapshot taken at install time.
 
 ## Install
 
 ```bash
 sudo apt install ipset jq ufw   # required
+brew install buddhilw/tap/cljw  # ClojureWasm runtime (Homebrew/Linuxbrew)
 git clone https://github.com/<you>/vpn-kis
+git clone https://github.com/<you>/vpn-kis-bb   # next to vpn-kis
 cd vpn-kis
 chmod +x vpn-firewall-setup.sh
+../vpn-kis-bb/bin/dry-run-check  # every command family, dry, no root needed
 ```
 
 ## Common workflows

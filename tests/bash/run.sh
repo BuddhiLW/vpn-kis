@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Stub harness for vpn-firewall-setup.sh: runs its functions under the
-# script's own `set -euo pipefail` with every privileged binary faked
-# (stub.sh) and /etc redirected into a temp root. No root, no network.
+# Stub harness for the legacy bash implementation
+# (lib/legacy/vpn-firewall-setup.bash, run with VPN_KIS_LEGACY=1): runs its
+# functions under the script's own `set -euo pipefail` with every privileged
+# binary faked (stub.sh) and /etc redirected into a temp root. No root, no
+# network.
 #
-#   tests/bash/run.sh [path/to/vpn-firewall-setup.sh]
+#   tests/bash/run.sh [path/to/vpn-firewall-setup.bash]
 #
 # Scenarios cover the Mullvad + Tailscale coexistence (mark-based bypass,
 # idempotent re-apply, tailscaled restart), panic under failing commands,
 # strict-mode rules and the NM hook triggers.
 set -uo pipefail
 H=$(cd "$(dirname "$0")" && pwd)
-SCRIPT=$(readlink -f "${1:-$H/../../vpn-firewall-setup.sh}")
+SCRIPT=$(readlink -f "${1:-$H/../../lib/legacy/vpn-firewall-setup.bash}")
 PASS=0; FAIL=0
 ROOTS=()
 trap 'rm -rf "${ROOTS[@]}"' EXIT
