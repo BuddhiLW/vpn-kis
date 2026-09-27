@@ -66,6 +66,8 @@ sudo ./vpn-firewall-setup.sh panic
 
 Strict mode requires periodic `fetch` runs as providers rotate IPs. Mullvad rotates rarely; AirVPN almost never; Tailscale DERP IPs only when servers move.
 
+In strict mode the whitelisted endpoints are reachable on **any port**: the IP set is the boundary. Mullvad picks a random WireGuard port on every reconnect and reaches its API through bridges on non-VPN ports (e.g. 1082/tcp), so locking ports made reconnects fail. `STRICT_PORTS=1` restores the old port lock.
+
 ## Custom providers
 
 Drop a list of IPs into `/etc/vpn-killswitch/providers/<name>.ips` (one per line, `#` comments allowed):
@@ -163,10 +165,12 @@ Set an explicit `PRIORITY=<N>` in the conf if you need a different ordering.
 
 When both are active, Mullvad's `inet mullvad` nftables table installs `forward` policy `DROP` and a final `reject` rule — only `oif wg0-mullvad` is permitted. Tailscale CGNAT (`100.64.0.0/10`) gets rejected; tailnet RFC1918 subnets get hijacked by Mullvad's fwmark default route (priority 5209) and dropped at the exit.
 
-This script handles both:
+Mullvad (2026.x) also places its catch-all `not fwmark 0x6d6f6c65` rule one priority above the lowest existing `ip rule` every time it reconnects, so "put our rules above Mullvad's" is an arms race: each reconnect jumps above them and the tailnet goes dark.
 
-1. **`mullvad lan set allow`** (you run this once) — opens RFC1918 + link-local in Mullvad's chains. Required for the next step to work.
-2. **`install_tailscale_route_rules`** (the script runs this) — adds `ip rule` entries at priority **5200** for Tailscale CGNAT and discovered RFC1918 subnets, lookup table 52. These beat Mullvad's rule 5209, so traffic to those CIDRs actually exits `tailscale0`. Persisted via `vpn-killswitch-tailscale-routes.service`.
+This script therefore does not compete on priority. It uses Mullvad's own split-tunnel contract, selected by destination:
+
+1. **`mullvad lan set allow`** (you run this once): opens RFC1918 + link-local in Mullvad's chains.
+2. **`tailscale-routes`** (the script runs this): nft table `inet vpn-killswitch-tailscale` marks packets to Tailscale CGNAT and the subnets tailscale routes (table 52) with `meta mark 0x6d6f6c65` (Mullvad's catch-all skips them; tailscale's `lookup 52` rule routes them) and `ct mark 0x00000f41` (Mullvad's firewall accepts them), and masquerades them to the `tailscale0` address. Only table-52 destinations are marked, never all of 10/8, so Mullvad's own DNS (10.64.0.1) stays in the tunnel. The apply is idempotent and survives tailscaled restarts; it is persisted via `vpn-killswitch-tailscale-routes.service`, and `panic` leaves it in place.
 
 For Kubernetes via a Tailscale subnet router, this means `kubectl` can target the cluster's kube-apiserver ClusterIP (`10.96.0.1` on a default service CIDR) directly — no per-node tailnet whitelist needed.
 

@@ -120,7 +120,29 @@ fetch_mullvad() {
             .openvpn.relays[]?.ipv4_addr_in,
             .bridge.relays[]?.ipv4_addr_in
           ] | .[] | select(. != null and . != "")' 2>/dev/null \
-        | sort -u)
+        | sort -u || true)
+    # A failed download must not replace the cached relay list with only the
+    # API address: strict mode would then block every relay.
+    if [[ -z "$relay_ips" ]]; then
+        warn "mullvad: relay list download failed; keeping the cached list"
+        return 1
+    fi
+
+    # The daemon's own caches: its relay list, and the API endpoint it last
+    # used (a direct address, or the encrypted-DNS proxy it reaches the API
+    # through). Proxy addresses are discovered at runtime via DoH, so they
+    # cannot all be listed; keeping the direct API address reachable lets
+    # the daemon fall back to it.
+    local app_cache=/var/cache/mullvad-vpn
+    if [[ -r "$app_cache/relays.json" ]]; then
+        relay_ips="$relay_ips $(jq -r '.. | objects | .ipv4_addr_in? | select(. != null)' \
+            "$app_cache/relays.json" 2>/dev/null || true)"
+    fi
+    if [[ -r "$app_cache/api-endpoint.json" ]]; then
+        api_ips="$api_ips $(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$app_cache/api-endpoint.json" || true)"
+    fi
+    # Built-in API address the daemon uses when api.mullvad.net DNS differs.
+    api_ips="$api_ips 45.83.223.196"
 
     # Resolve Mullvad control plane / API hosts (needed for QR handshake + reconnect)
     local api_hosts="api.mullvad.net"
@@ -413,6 +435,9 @@ detect_vpn_endpoints() {
 # network/apt deps, works with empty resolv.conf and no internet.
 # Usage from TTY: sudo /path/to/vpn-firewall-setup.sh panic
 panic_recover() {
+    # Best effort by design: one failing step (e.g. a grep with no match
+    # under pipefail) must never abort recovery halfway through.
+    set +e +o pipefail
     printf '\n=== VPN-KILLSWITCH PANIC RECOVERY ===\n\n'
 
     # 1. Stop UFW (best effort — even if binary missing, raw iptables flush below covers it)
@@ -448,16 +473,11 @@ panic_recover() {
     rm -f /etc/ufw/before.init 2>/dev/null || true
 
     remove_tailscale_web
-    # 4b. Remove tailscale route rules + boot-persistence unit
-    echo "[*] Removing Tailscale routing rules..."
-    if [ -f /etc/systemd/system/vpn-killswitch-tailscale-routes.service ]; then
-        systemctl disable --now vpn-killswitch-tailscale-routes.service 2>/dev/null || true
-        rm -f /etc/systemd/system/vpn-killswitch-tailscale-routes.service
-        systemctl daemon-reload 2>/dev/null || true
-    fi
-    while ip rule del priority 5200 2>/dev/null; do :; done
-    remove_tailscale_nft
-    remove_tailscaled_dropin
+    # 4b. KEEP the tailnet bypass (nft marks, boot unit, tailscaled drop-in).
+    # It only lets tailnet traffic past Mullvad; it blocks nothing, and
+    # removing it is what cut off the tailnet/k8s during a panic. Remove it
+    # explicitly with: tailscale-routes remove
+    echo "[*] Keeping Tailscale bypass (remove with: $0 tailscale-routes remove)"
 
     # 4c. Remove split-tunnel units + ip rules + ipsets
     echo "[*] Removing split-tunnel rules..."
@@ -470,7 +490,8 @@ panic_recover() {
         systemctl daemon-reload 2>/dev/null || true
     fi
     if command -v ipset >/dev/null 2>&1; then
-        ipset list -name 2>/dev/null | grep '^vpnkis_split_' | while read -r s; do
+        local s
+        for s in $(ipset list -name 2>/dev/null | grep '^vpnkis_split_' || true); do
             ipset destroy "$s" 2>/dev/null || true
         done
     fi
@@ -575,6 +596,9 @@ What is NOT reverted (persists across reboot):
   - /etc/modprobe.d/disable-ipv6.conf
   - /etc/default/grub  (ipv6.disable=1 kernel arg)
   - UFW rule files in /etc/ufw/  (UFW disabled but rules remain)
+  - Tailscale bypass past Mullvad (nft table inet vpn-killswitch-tailscale,
+    boot unit, tailscaled drop-in) so the tailnet stays reachable.
+    Remove with: sudo /path/to/vpn-firewall-setup.sh tailscale-routes remove
 
 To fully revert IPv6 disable:
   sudo rm /etc/sysctl.d/99-disable-ipv6.conf /etc/modprobe.d/disable-ipv6.conf
@@ -1042,13 +1066,25 @@ BEFORE_DNS
         setup_endpoint_ipset
         local ep_count
         ep_count=$(echo "$VPN_ENDPOINTS" | wc -w)
-        echo "# --- VPN tunnel ports (locked to ipset vpn_endpoints: $ep_count IPs) ---" >> /etc/ufw/before.rules
-        for port in $VPN_PORTS_UDP; do
-            echo "-A ufw-before-output -o $PHYSICAL_IF -p udp --dport $port -m set --match-set vpn_endpoints dst -j ACCEPT" >> /etc/ufw/before.rules
-        done
-        for port in $VPN_PORTS_TCP; do
-            [[ -n "$port" ]] && echo "-A ufw-before-output -o $PHYSICAL_IF -p tcp --dport $port -m set --match-set vpn_endpoints dst -j ACCEPT" >> /etc/ufw/before.rules
-        done
+        if [[ "${STRICT_PORTS:-0}" == "1" ]]; then
+            # Legacy: endpoints reachable on VPN_PORTS only.
+            echo "# --- VPN tunnel ports (locked to ipset vpn_endpoints: $ep_count IPs) ---" >> /etc/ufw/before.rules
+            for port in $VPN_PORTS_UDP; do
+                echo "-A ufw-before-output -o $PHYSICAL_IF -p udp --dport $port -m set --match-set vpn_endpoints dst -j ACCEPT" >> /etc/ufw/before.rules
+            done
+            for port in $VPN_PORTS_TCP; do
+                if [[ -n "$port" ]]; then
+                    echo "-A ufw-before-output -o $PHYSICAL_IF -p tcp --dport $port -m set --match-set vpn_endpoints dst -j ACCEPT" >> /etc/ufw/before.rules
+                fi
+            done
+        else
+            # Any port, but only to endpoint IPs: the ipset is the boundary.
+            # Mullvad picks a random WireGuard port (4000-60000) on every
+            # reconnect and reaches its API through bridges on ports like
+            # 1082/tcp; a port lock drops those and the tunnel cannot come back.
+            echo "# --- VPN endpoints, any port (ipset vpn_endpoints: $ep_count IPs; STRICT_PORTS=1 for the old port lock) ---" >> /etc/ufw/before.rules
+            echo "-A ufw-before-output -o $PHYSICAL_IF -m set --match-set vpn_endpoints dst -j ACCEPT" >> /etc/ufw/before.rules
+        fi
     fi
 
     echo "" >> /etc/ufw/before.rules
@@ -1106,22 +1142,31 @@ make_persistent() {
     ufw reload >/dev/null 2>&1 || true
 }
 
-# ---------- Tailscale subnet routing ----------
+# ---------- Tailscale behind Mullvad ----------
 #
-# When Mullvad is connected, its fwmark default-route rule catches any packet
-# without explicit policy. Tailscale's own subnet routes live in table 52 at
-# priority 5270 (BELOW Mullvad), so packets to tailnet CGNAT and advertised
-# subnets get hijacked by Mullvad and dropped at the exit (RFC1918) or
-# rejected by Mullvad's nftables forward chain (CGNAT).
+# When Mullvad is connected, its catch-all rule
+#   not from all fwmark 0x6d6f6c65 lookup <mullvad table>
+# sends every unmarked packet into the tunnel, including packets to the
+# tailnet (CGNAT 100.64/10 and subnets advertised through tailscale0, e.g.
+# k8s service/pod CIDRs). Tailscale's own `lookup 52` rule sits below it.
 #
-# These rules push table-52 lookups for those CIDRs ABOVE Mullvad's rule,
-# so host AND container traffic to tailnet destinations exit tailscale0.
+# Mullvad (2026.x) places that rule one priority ABOVE the lowest existing
+# ip rule every time it (re)connects. Any "slot our rules above Mullvad"
+# scheme is therefore an arms race: each reconnect jumps above our rules and
+# the tailnet goes dark until something moves them again. (That is the
+# history in older comments: Mullvad at 5209 above tailscale's 5210, then
+# 5199 above our old 5200, drifting down on every reconnect.)
 #
-# Priority is detected at install time: we find Mullvad's fwmark rule
-# (mark 0x6d6f6c65 — "mole") and place ours one below. Mullvad app builds
-# have used different priorities over time (5199 today, 5209 historically),
-# so hardcoding is fragile. Fallback to TAILSCALE_RULE_PRIO_FALLBACK if
-# Mullvad isn't running at install time.
+# So we do not compete on priority. Tailnet destinations use Mullvad's own
+# split-tunnel contract instead, selected by destination rather than cgroup:
+#   meta mark 0x6d6f6c65  -> Mullvad's catch-all skips the packet, which
+#                            falls through to tailscale's `lookup 52` rule
+#   ct mark 0x00000f41    -> Mullvad's firewall accepts the connection
+# The socket already picked the Mullvad tunnel source address before the
+# reroute, so the packet is masqueraded to the tailscale0 address.
+#
+# Only destinations tailscale actually routes (table 52) are marked, never
+# all of 10/8: Mullvad's own DNS/gateway 10.64.0.1 must stay in the tunnel.
 TAILSCALE_RULE_PRIO_FALLBACK=5100
 TAILSCALE_RULE_PRIO=""   # populated by detect_tailscale_rule_prio
 TAILSCALE_ROUTE_TABLE=52
@@ -1131,6 +1176,12 @@ MULLVAD_CT_MARK=0x00000f41
 TAILSCALE_NFT_TABLE=vpn-killswitch-tailscale
 TAILSCALED_DROPIN=/etc/systemd/system/tailscaled.service.d/50-vpn-killswitch-mullvad.conf
 TAILSCALE_WEB_ENABLED=/etc/vpn-killswitch/tailscale-web.enabled
+# Last-applied tailnet destination set, kept while tailscaled restarts (its
+# table 52 is empty then) so the bypass never shrinks mid-restart.
+TAILNET_CIDRS_FILE=/etc/vpn-killswitch/tailnet.cidrs
+# Versioned tag in the nft ruleset: apply is a no-op when this is present
+# with the same destination set, so repeated applies never churn.
+TAILSCALE_NFT_TAG="vpn-kis tailnet bypasses Mullvad v2"
 
 tailscale_web_helper() {
     python3 "$(dirname "$(readlink -f "$0")")/lib/tailscale-web/configure.py" "$@"
@@ -1144,6 +1195,8 @@ remove_tailscale_web() {
 detect_tailscale_rule_prio() {
     # Find Mullvad's fwmark default-route rule and place ours one below.
     # `ip rule show` format: "<prio>:\t<selectors> lookup <table>"
+    # Only split tunnels still use this (PRIORITY=auto); the tailnet uses
+    # marks, see the section comment above.
     local mullvad_prio
     mullvad_prio=$(ip rule show 2>/dev/null \
         | awk -v mark="$MULLVAD_FWMARK" '$0 ~ "fwmark " mark { sub(/:/,"",$1); print $1; exit }')
@@ -1180,33 +1233,74 @@ remove_tailscale_policy_rules() {
         | awk '$4 == "to" && $6 == "lookup" && $7 == "52" {print $5}')
 }
 
-# Routing alone is not enough: Mullvad's `inet mullvad` output chain ends in
-# a bare `reject` and only accepts conntrack entries carrying its split-tunnel
-# ct mark. Host traffic to the tailnet leaves via tailscale0 and gets an
-# instant RST ("connection refused" in 0 ms).
-#
-# Match on the egress interface rather than a snapshot of table 52: route
-# discovery races tailscaled restarts, oifname does not. Only private/CGNAT
-# destinations are tagged, so exit-node traffic to the public internet still
-# hits Mullvad's reject (fail closed). Same idiom as lib/tailscale-web: filter
-# hook after conntrack, ct mark only, routing left to Tailscale's rules.
+# Tailnet destinations to mark: CGNAT plus whatever table 52 routes through
+# tailscale0. While tailscaled restarts, table 52 is empty; keep the last
+# applied set then, so the bypass never shrinks mid-restart.
+tailnet_destinations() {
+    local current table52
+    current=$(discover_tailscale_cidrs | xargs)
+    table52=$(ip route show table "$TAILSCALE_ROUTE_TABLE" 2>/dev/null || true)
+    if [[ "$current" == "100.64.0.0/10" && -s "$TAILNET_CIDRS_FILE" \
+          && "$table52" != *"dev tailscale"* ]]; then
+        xargs < "$TAILNET_CIDRS_FILE"
+        return 0
+    fi
+    echo "$current"
+}
+
+# The whole table in one nft transaction: create-if-missing, delete,
+# recreate. There is never a window without the rules.
+render_tailscale_nft() {
+    local elems
+    elems=$(printf '%s, ' "$@")
+    elems=${elems%, }
+    cat <<NFT
+table inet $TAILSCALE_NFT_TABLE
+delete table inet $TAILSCALE_NFT_TABLE
+table inet $TAILSCALE_NFT_TABLE {
+    set tailnet {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { $elems }
+    }
+    chain route_out {
+        type route hook output priority mangle; policy accept;
+        ip daddr @tailnet meta mark set $MULLVAD_FWMARK ct mark set $MULLVAD_CT_MARK comment "$TAILSCALE_NFT_TAG"
+    }
+    chain mark_forwarded {
+        type filter hook prerouting priority mangle; policy accept;
+        iifname != "tailscale0" ip daddr @tailnet meta mark set $MULLVAD_FWMARK ct mark set $MULLVAD_CT_MARK
+    }
+    chain snat_tailnet {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "tailscale0" ct mark $MULLVAD_CT_MARK masquerade
+    }
+}
+NFT
+}
+
 remove_tailscale_nft() {
     command -v nft >/dev/null 2>&1 || return 0
     nft delete table inet "$TAILSCALE_NFT_TABLE" 2>/dev/null || true
 }
 
+# Idempotent: a no-op when the live table already carries this version's
+# tag and the destination set is unchanged.
 apply_tailscale_nft() {
-    command -v nft >/dev/null 2>&1 || { warn "nft not found — Mullvad will reject tailnet traffic"; return 0; }
-    remove_tailscale_nft
-    nft -f - <<NFT
-table inet $TAILSCALE_NFT_TABLE {
-    chain output {
-        type filter hook output priority -10; policy accept;
-        oifname "tailscale0" ip daddr { 100.64.0.0/10, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } ct mark set $MULLVAD_CT_MARK comment "tailnet over tailscale0 past Mullvad"
-    }
-}
-NFT
-    info "Tailnet traffic on tailscale0 marked as Mullvad-excluded (nft table inet $TAILSCALE_NFT_TABLE)"
+    command -v nft >/dev/null 2>&1 || { warn "nft not found — Mullvad will capture tailnet traffic"; return 0; }
+    local dests live stored
+    dests=$(tailnet_destinations)
+    live=$(nft list table inet "$TAILSCALE_NFT_TABLE" 2>/dev/null || true)
+    stored=$(xargs < "$TAILNET_CIDRS_FILE" 2>/dev/null || true)
+    if [[ "$live" == *"$TAILSCALE_NFT_TAG"* && "$stored" == "$dests" ]]; then
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    render_tailscale_nft $dests | nft -f -
+    mkdir -p "$(dirname "$TAILNET_CIDRS_FILE")"
+    tr ' ' '\n' <<<"$dests" > "$TAILNET_CIDRS_FILE"
+    info "Tailnet bypasses Mullvad by mark (nft table inet $TAILSCALE_NFT_TABLE): $dests"
 }
 
 # tailscaled's own egress (control plane, DERP, WireGuard UDP) must bypass
@@ -1220,7 +1314,10 @@ exclude_tailscaled_from_mullvad() {
     local pid
     pid=$(systemctl show -p MainPID --value tailscaled 2>/dev/null || true)
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
-    if mullvad split-tunnel list 2>/dev/null | grep -qx "$pid"; then
+    # The listing indents PIDs; match the number as a whole field.
+    local listing
+    listing=$(mullvad split-tunnel list 2>/dev/null || true)
+    if grep -qE "(^|[[:space:]])${pid}([[:space:]]|$)" <<<"$listing"; then
         return 0
     fi
     if mullvad split-tunnel add "$pid" >/dev/null 2>&1; then
@@ -1254,22 +1351,20 @@ remove_tailscaled_dropin() {
     systemctl daemon-reload 2>/dev/null || true
 }
 
+# Safe to run any number of times (boot unit, NM hook, by hand): it changes
+# nothing when the bypass is already current.
 apply_tailscale_route_rules() {
-    local cidrs cidr
-    cidrs=$(discover_tailscale_cidrs | xargs)
-    [[ -z "$cidrs" ]] && return 0
-
-    detect_tailscale_rule_prio
-    remove_tailscale_policy_rules
-
-    info "Installing Tailscale routing rules (priority $TAILSCALE_RULE_PRIO → table $TAILSCALE_ROUTE_TABLE):"
-    for cidr in $cidrs; do
-        ip rule add to "$cidr" lookup $TAILSCALE_ROUTE_TABLE priority $TAILSCALE_RULE_PRIO
-        info "  $cidr"
-    done
+    # Marks first, then retire the priority rules older versions installed
+    # (make-before-break). Those rules are what Mullvad kept jumping above.
     apply_tailscale_nft
+    local rules
+    rules=$(ip rule show 2>/dev/null || true)
+    if grep -qE "^[0-9]+:.*[[:space:]]to[[:space:]].*lookup $TAILSCALE_ROUTE_TABLE\$" <<<"$rules"; then
+        remove_tailscale_policy_rules
+        info "Removed legacy Tailscale ip rules (replaced by the mark-based bypass)"
+    fi
     exclude_tailscaled_from_mullvad
-    if [[ -f "$TAILSCALE_WEB_ENABLED" ]]; then
+    if [[ -f "$TAILSCALE_WEB_ENABLED" ]] && ! nft list table inet hive_openclaw_client >/dev/null 2>&1; then
         # Missing peer/route fails closed for OpenClaw without breaking other routes.
         tailscale_web_helper apply || warn "OpenClaw client check failed; inspect output and rerun tailscale-routes apply when Tailscale is ready."
     fi
@@ -1293,7 +1388,7 @@ install_tailscale_route_rules() {
 
     cat > "$TAILSCALE_ROUTES_UNIT" <<UNIT
 [Unit]
-Description=VPN Kill-Switch — dynamic Tailscale subnet route rules
+Description=VPN Kill-Switch: tailnet traffic bypasses Mullvad (nft marks)
 After=network-online.target tailscaled.service mullvad-daemon.service
 Wants=network-online.target tailscaled.service
 
@@ -1320,6 +1415,7 @@ remove_tailscale_route_rules() {
     fi
     remove_tailscale_policy_rules
     remove_tailscale_nft
+    rm -f "$TAILNET_CIDRS_FILE"
     remove_tailscaled_dropin
 }
 
@@ -2081,10 +2177,14 @@ BAK="$RULES.nm-bak"
 
 log() { logger -t "$LOG_TAG" -- "$*"; }
 
+# Re-applies the tailnet bypass (idempotent: a no-op unless tailscale's
+# routes changed). Mullvad events are deliberately NOT a trigger: the
+# bypass is mark-based and independent of Mullvad's rule priority, and
+# reacting to every Mullvad reconnect is what used to churn rules mid-handshake.
 refresh_tailscale_routes() {
     systemctl is-enabled --quiet vpn-killswitch-tailscale-routes.service 2>/dev/null || return 0
     systemctl restart vpn-killswitch-tailscale-routes.service 2>/dev/null \
-        || log "failed to refresh Tailscale policy routes"
+        || log "failed to refresh Tailscale bypass"
 }
 
 # Pattern of ifaces we must NEVER pin the killswitch DROP rule onto.
@@ -2105,7 +2205,7 @@ esac
 # events fire NEW_IF detection at the wrong moment (tunnel = default route).
 if [ -n "$IFACE" ] && is_virtual "$IFACE"; then
     case "$IFACE" in
-        wg*|tailscale*) refresh_tailscale_routes ;;
+        tailscale*) refresh_tailscale_routes ;;
     esac
     exit 0
 fi
@@ -2153,7 +2253,7 @@ if is_virtual "$NEW_IF"; then
     exit 0
 fi
 
-[ "$NEW_IF" = "$CURRENT" ] && { refresh_tailscale_routes; exit 0; }
+[ "$NEW_IF" = "$CURRENT" ] && exit 0
 
 log "physical IF changed: $CURRENT -> $NEW_IF, reapplying"
 
