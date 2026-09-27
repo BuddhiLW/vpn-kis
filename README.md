@@ -223,6 +223,16 @@ If `<host>.<tailnet>.ts.net` returns NXDOMAIN and even `curl --resolve`
 cannot connect, route priority alone is insufficient: Mullvad rejects unmarked
 Tailscale traffic, and this workstation deliberately disables Tailscale DNS.
 The initial `tailscale-web` profile is restricted to this OpenClaw endpoint.
+Name that endpoint once in `/etc/vpn-killswitch/tailscale-web.conf` (or in
+`TAILSCALE_WEB_HOST` / `TAILSCALE_WEB_IP`); without it the helper changes nothing:
+
+```sh
+sudo tee /etc/vpn-killswitch/tailscale-web.conf <<'EOF'
+HOST=<host>.<tailnet>.ts.net
+IP=<its 100.x address>
+EOF
+```
+
 Your normal combined provider command enables it automatically:
 
 ```sh
