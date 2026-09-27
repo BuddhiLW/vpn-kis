@@ -88,7 +88,9 @@ def main():
                 if p.get("DNSName", "").rstrip(".") == host]
     if len(matching) != 1 or ip not in matching[0].get("TailscaleIPs", []):
         raise SystemExit("Pinned address does not match Tailscale peer identity; no changes made.")
-    route = run("ip", "-4", "route", "get", ip).stdout.split()
+    # Tailnet packets carry Mullvad's split-tunnel mark (vpn-firewall-setup.sh
+    # tailscale-routes), so check the route a marked packet takes.
+    route = run("ip", "-4", "route", "get", ip, "mark", "0x6d6f6c65").stdout.split()
     if "dev" not in route or route[route.index("dev") + 1] != "tailscale0":
         raise SystemExit("Destination is not routed through tailscale0; no changes made.")
     rules = ruleset(ip)
