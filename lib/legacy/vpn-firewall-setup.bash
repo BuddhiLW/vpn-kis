@@ -1181,7 +1181,12 @@ TAILSCALE_WEB_ENABLED=/etc/vpn-killswitch/tailscale-web.enabled
 TAILNET_CIDRS_FILE=/etc/vpn-killswitch/tailnet.cidrs
 # Versioned tag in the nft ruleset: apply is a no-op when this is present
 # with the same destination set, so repeated applies never churn.
-TAILSCALE_NFT_TAG="vpn-kis tailnet bypasses Mullvad v2"
+TAILSCALE_NFT_TAG="vpn-kis tailnet bypasses Mullvad v3"
+# tailscaled's iptables mangle OUTPUT rule copies (mark & 0xff0000) into the
+# connmark of new flows; MULLVAD_FWMARK has 0x6f there, so MULLVAD_CT_MARK
+# becomes this value and every rule keyed on it (our masquerade, Mullvad's
+# accept/masquerade for excluded apps) misses. restore_ctmark undoes it.
+TAILSCALE_CLOBBERED_CT_MARK=0x006f0000
 
 tailscale_web_helper() {
     python3 "$(dirname "$(readlink -f "$0")")/lib/tailscale-web/configure.py" "$@"
@@ -1271,6 +1276,10 @@ table inet $TAILSCALE_NFT_TABLE {
     chain mark_forwarded {
         type filter hook prerouting priority mangle; policy accept;
         iifname != "tailscale0" ip daddr @tailnet meta mark set $MULLVAD_FWMARK ct mark set $MULLVAD_CT_MARK
+    }
+    chain restore_ctmark {
+        type filter hook output priority mangle + 10; policy accept;
+        ct state new meta mark $MULLVAD_FWMARK ct mark $TAILSCALE_CLOBBERED_CT_MARK ct mark set $MULLVAD_CT_MARK
     }
     chain snat_tailnet {
         type nat hook postrouting priority srcnat; policy accept;
